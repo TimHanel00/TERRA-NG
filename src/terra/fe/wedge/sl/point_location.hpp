@@ -101,6 +101,45 @@ KOKKOS_INLINE_FUNCTION WedgeCell wedge_edge_neighbor( const WedgeCell& c, const 
     return n;
 }
 
+/// @brief Unit-sphere position of one lateral node.
+template < typename T, typename CoordsShellType >
+KOKKOS_INLINE_FUNCTION dense::Vec< T, 3 > lateral_node_position(
+    const int              subdomain,
+    const int              x,
+    const int              y,
+    const CoordsShellType& coords_shell )
+{
+    dense::Vec< T, 3 > p;
+    for ( int d = 0; d < 3; ++d )
+    {
+        p( d ) = coords_shell( subdomain, x, y, d );
+    }
+    return p;
+}
+
+/// @brief Cone coordinates of a physical point w.r.t. an arbitrary triangle of lateral nodes.
+///
+/// Solves \f$ A \mu = X \f$ with \f$ A = [p_1 \, p_2 \, p_3] \f$, so that \f$ \mu \f$ is the unique coefficient
+/// vector with \f$ X = \mu_1 p_1 + \mu_2 p_2 + \mu_3 p_3 \f$ and `mu >= 0` is the cone containment test,
+/// irrespective of how the triangle is wound.
+template < typename T, typename CoordsShellType >
+KOKKOS_INLINE_FUNCTION void triangle_cone_coords(
+    const dense::Vec< T, 3 >& X,
+    const int                 subdomain,
+    const int ( &nx )[3],
+    const int ( &ny )[3],
+    const CoordsShellType& coords_shell,
+    dense::Vec< T, 3 >&    mu )
+{
+    dense::Vec< T, 3 > p[3];
+    for ( int v = 0; v < 3; ++v )
+    {
+        p[v] = lateral_node_position< T >( subdomain, nx[v], ny[v], coords_shell );
+    }
+
+    mu = dense::Mat< T, 3, 3 >::from_col_vecs( p[0], p[1], p[2] ).inv() * X;
+}
+
 /// @brief Cone coordinates of a physical point w.r.t. the triangle of a wedge cell.
 ///
 /// Solves \f$ A \mu = X \f$ with \f$ A = [p_1 \, p_2 \, p_3] \f$ (unit-sphere vertices).
@@ -129,20 +168,7 @@ KOKKOS_INLINE_FUNCTION void wedge_lateral_cone_coords(
     int nx[3], ny[3];
     wedge_lateral_node_indices( cell, nx, ny );
 
-    dense::Vec< T, 3 > p[3];
-    for ( int v = 0; v < 3; ++v )
-    {
-        for ( int d = 0; d < 3; ++d )
-        {
-            p[v]( d ) = coords_shell( subdomain, nx[v], ny[v], d );
-        }
-    }
-
-    const auto A = dense::Mat< T, 3, 3 >::from_col_vecs( p[0], p[1], p[2] );
-
-    // mu is the unique coefficient vector with X = mu_1 p_1 + mu_2 p_2 + mu_3 p_3, so `mu >= 0` is the cone
-    // containment test irrespective of how the triangle is wound.
-    mu = A.inv() * X;
+    triangle_cone_coords( X, subdomain, nx, ny, coords_shell, mu );
 }
 
 /// @brief Adapts a `(subdomain, x, y, r, d)` coordinate view to the lateral `(subdomain, x, y, d)` accessor
@@ -424,6 +450,248 @@ KOKKOS_INLINE_FUNCTION LocateResult< T > locate_point(
     result.found = true;
 
     return result;
+}
+
+/// @brief Lateral index rectangle whose four corner nodes span the spherical quad used by the O(1) predictor.
+///
+/// The corners are the nodes `(x0, y0)`, `(x1, y0)`, `(x0, y1)` and `(x1, y1)`. They must carry valid geometry,
+/// so for a ghosted field pass the *owned* corners rather than the corners of the ghosted view: the predictor
+/// extrapolates happily into the ghost layer, but the degenerate diagonal ghost corners would poison the map.
+struct LateralCornerBox
+{
+    int x0 = 0;
+    int y0 = 0;
+    int x1 = 0;
+    int y1 = 0;
+};
+
+/// @brief Corner box of a plain (non-ghosted) index space, i.e. the whole subdomain.
+KOKKOS_INLINE_FUNCTION LateralCornerBox corner_box_from_bounds( const IndexBounds& bounds )
+{
+    return LateralCornerBox{ 0, 0, bounds.num_nodes_x - 1, bounds.num_nodes_y - 1 };
+}
+
+/// @brief Hex cell and triangle containing the continuous lateral index coordinates `(u, v)`.
+///
+/// `(u, v)` is clamped into the index space, so the result is always a representable cell. The triangle is
+/// picked by the same anti-diagonal split the mesh uses inside a hex cell: `w = 0` for the lower-left half.
+template < typename T >
+KOKKOS_INLINE_FUNCTION WedgeCell lateral_cell_from_index_coords( const T u, const T v, const IndexBounds& bounds )
+{
+    // The hex cell (x, y) spans nodes x..x+1, so the last cell index is num_nodes - 2.
+    const int max_cx = bounds.num_nodes_x - 2;
+    const int max_cy = bounds.num_nodes_y - 2;
+
+    WedgeCell cell;
+    cell.x = Kokkos::clamp( static_cast< int >( Kokkos::floor( u ) ), 0, max_cx );
+    cell.y = Kokkos::clamp( static_cast< int >( Kokkos::floor( v ) ), 0, max_cy );
+    cell.r = 0;
+
+    // Where (u, v) was clamped the fractional parts leave [0, 1]; the comparison then simply picks the triangle
+    // of the boundary cell that faces the point, which is the closest representable answer.
+    const T fx = u - static_cast< T >( cell.x );
+    const T fy = v - static_cast< T >( cell.y );
+    cell.w     = ( fx + fy <= T( 1 ) ) ? 0 : 1;
+
+    return cell;
+}
+
+/// @brief Outcome of the O(1) index prediction.
+template < typename T >
+struct CellPrediction
+{
+    /// Continuous lateral index coordinates of the point (not clamped).
+    T u = 0;
+    T v = 0;
+    /// `(u, v)` clamped into the index space and turned into a cell.
+    WedgeCell cell;
+    /// The point lies in neither half of the corner quad, so `cell` is only a nearest-corner guess.
+    bool outside_quad = false;
+};
+
+/// @brief O(1) estimate of the lateral index coordinates of a physical point, without any walk.
+///
+/// The quad spanned by `box` (a whole diamond, in the one-subdomain-per-diamond case) is split along its
+/// anti-diagonal into the two spherical triangles \f$ \{ c_{00}, c_{10}, c_{01} \} \f$ and
+/// \f$ \{ c_{11}, c_{01}, c_{10} \} \f$ — the same split orientation the mesh uses inside every hex cell. The
+/// cone coordinates w.r.t. those corners say which half the point is in (all components non-negative, see the
+/// warning on \ref wedge_lateral_cone_coords about testing before normalising) and, once normalised to
+/// barycentric coordinates \f$ \lambda \f$, where in that half:
+///
+/// \f[
+///     u = x_0 + \lambda_1 (x_1 - x_0), \qquad v = y_0 + \lambda_2 (y_1 - y_0)
+/// \f]
+///
+/// for the first triangle, and the mirrored expression \f$ u = x_1 - \lambda_1 (x_1 - x_0) \f$,
+/// \f$ v = y_1 - \lambda_2 (y_1 - y_0) \f$ for the second. The cost is one or two 3x3 solves and does not
+/// depend on the refinement level.
+///
+/// @note This is an **estimate**, not the answer. Mapping barycentric coordinates linearly onto index space is
+///       exact only for a grid obtained by gnomonic (central) projection of a uniformly subdivided planar
+///       triangle. The shell grid is instead built by recursive normalised bisection (see
+///       \ref terra::grid::shell::compute_node_recursive), which places nodes at equal *angles* along the
+///       diamond edges. Both agree at the corners and at the edge midpoints and disagree in between: along an
+///       edge of angular width \f$ \Theta \f$ the barycentric coordinate of the node at angle \f$ \theta \f$ is
+///       \f$ \sin\theta / (\sin\theta + \sin(\Theta - \theta)) \f$ rather than \f$ \theta / \Theta \f$, which
+///       peaks at about 2% of the edge — a fraction of a cell at low refinement, but \f$ 0.02 N \f$ cells at
+///       production resolutions. \ref locate_point_direct corrects for this against the real node positions.
+template < typename T, typename CoordsShellType >
+KOKKOS_INLINE_FUNCTION CellPrediction< T > predict_lateral_cell(
+    const dense::Vec< T, 3 >& X,
+    const int                 subdomain,
+    const CoordsShellType&    coords_shell,
+    const LateralCornerBox&   box,
+    const IndexBounds&        bounds,
+    const T                   eps )
+{
+    const T tol = eps * X.norm();
+
+    // Triangle A = ( c00, c10, c01 ), triangle B = ( c11, c01, c10 ).
+    const int ax[3] = { box.x0, box.x1, box.x0 };
+    const int ay[3] = { box.y0, box.y0, box.y1 };
+    const int bx[3] = { box.x1, box.x0, box.x1 };
+    const int by[3] = { box.y1, box.y1, box.y0 };
+
+    dense::Vec< T, 3 > mu_a;
+    triangle_cone_coords( X, subdomain, ax, ay, coords_shell, mu_a );
+    const T min_a = Kokkos::min( mu_a( 0 ), Kokkos::min( mu_a( 1 ), mu_a( 2 ) ) );
+
+    CellPrediction< T > pred;
+
+    bool               in_a = min_a >= -tol;
+    dense::Vec< T, 3 > mu   = mu_a;
+
+    if ( !in_a )
+    {
+        dense::Vec< T, 3 > mu_b;
+        triangle_cone_coords( X, subdomain, bx, by, coords_shell, mu_b );
+        const T min_b = Kokkos::min( mu_b( 0 ), Kokkos::min( mu_b( 1 ), mu_b( 2 ) ) );
+
+        if ( min_b >= -tol )
+        {
+            mu = mu_b;
+        }
+        else
+        {
+            // Outside the quad altogether. Fall back to the triangle the point is least far outside of and let
+            // the caller's clamping produce a nearest-corner guess.
+            pred.outside_quad = true;
+            in_a              = min_a >= min_b;
+            mu                = in_a ? mu_a : mu_b;
+        }
+    }
+
+    const T rho = mu( 0 ) + mu( 1 ) + mu( 2 );
+    const T dx  = static_cast< T >( box.x1 - box.x0 );
+    const T dy  = static_cast< T >( box.y1 - box.y0 );
+
+    if ( rho <= T( 0 ) )
+    {
+        // More than 90 degrees away from the triangle: the barycentric coordinates are meaningless (see the
+        // warning on wedge_lateral_cone_coords). Aim at the middle of the box instead.
+        pred.outside_quad = true;
+        pred.u            = T( 0.5 ) * static_cast< T >( box.x0 + box.x1 );
+        pred.v            = T( 0.5 ) * static_cast< T >( box.y0 + box.y1 );
+    }
+    else
+    {
+        const T inv = T( 1 ) / rho;
+        const T l1  = mu( 1 ) * inv;
+        const T l2  = mu( 2 ) * inv;
+
+        pred.u = in_a ? static_cast< T >( box.x0 ) + l1 * dx : static_cast< T >( box.x1 ) - l1 * dx;
+        pred.v = in_a ? static_cast< T >( box.y0 ) + l2 * dy : static_cast< T >( box.y1 ) - l2 * dy;
+    }
+
+    pred.cell = lateral_cell_from_index_coords( pred.u, pred.v, bounds );
+    return pred;
+}
+
+/// @brief Locates a physical point without a long walk: O(1) barycentric prediction plus affine refinement.
+///
+/// A drop-in alternative to \ref locate_point that needs no seed and whose cost does not grow with the
+/// refinement level. Three stages:
+///
+///   1. \ref predict_lateral_cell gives a cell in O(1) from the corner quad.
+///   2. That estimate is refined against the actual mesh. At the current cell the barycentric coordinates of
+///      the point form an affine model of the index-space map, and evaluating that model *outside* the cell
+///      extrapolates straight at the cell the point should be in:
+///      \f$ (u, v) = \sum_k \lambda_k \, (n^x_k, n^y_k) \f$ over the cell's three lateral nodes. Since the map
+///      from index space to the sphere is smooth, the extrapolation error over \f$ \Delta \f$ cells is
+///      \f$ \mathcal{O}( \Delta^2 \Theta / N ) \f$ cells, so a single jump absorbs essentially all of the
+///      bisection-versus-gnomonic mismatch of stage 1 and `max_refinements = 2` is ample.
+///   3. \ref locate_point finishes from that cell with a small step budget. Going through the walk (rather
+///      than trusting stage 2) is what makes the result *identical* to a full walk, including the escape,
+///      radial clamping and node-validity reporting.
+///
+/// `max_walk_steps` therefore only has to absorb the residual of stage 2 — a cell or two — instead of the
+/// diameter of the subdomain. All other arguments have the same meaning as in \ref locate_point.
+template < typename T, typename CoordsShellType, typename CoordsRadiiType, typename LateralValidityType >
+KOKKOS_INLINE_FUNCTION LocateResult< T > locate_point_direct(
+    const dense::Vec< T, 3 >& X,
+    const int                 subdomain,
+    const CoordsShellType&    coords_shell,
+    const CoordsRadiiType&    coords_radii,
+    const LateralCornerBox&   box,
+    const IndexBounds&        bounds,
+    const int                 max_refinements,
+    const int                 max_walk_steps,
+    const T                   eps,
+    const bool                clamp_radially,
+    const T                   rho_clamp_min,
+    const T                   rho_clamp_max,
+    const LateralValidityType& lateral_valid )
+{
+    const T tol = eps * X.norm();
+
+    WedgeCell cell = predict_lateral_cell( X, subdomain, coords_shell, box, bounds, eps ).cell;
+
+    // locate_point() refuses to start from a cell touching a degenerate ghost corner, so retreat to the middle
+    // of the corner box, which is owned geometry by construction.
+    if ( !wedge_lateral_nodes_valid( cell, subdomain, lateral_valid ) )
+    {
+        cell = lateral_cell_from_index_coords(
+            T( 0.5 ) * static_cast< T >( box.x0 + box.x1 ), T( 0.5 ) * static_cast< T >( box.y0 + box.y1 ), bounds );
+    }
+
+    for ( int it = 0; it < max_refinements; ++it )
+    {
+        dense::Vec< T, 3 > mu;
+        wedge_lateral_cone_coords( X, subdomain, cell, coords_shell, mu );
+
+        if ( Kokkos::min( mu( 0 ), Kokkos::min( mu( 1 ), mu( 2 ) ) ) >= -tol )
+            break; // already the containing cell; the walk below will confirm it in one step
+
+        const T rho = mu( 0 ) + mu( 1 ) + mu( 2 );
+        if ( rho <= T( 0 ) )
+            break; // barycentric coordinates unusable here; leave it to the walk
+
+        int nx[3], ny[3];
+        wedge_lateral_node_indices( cell, nx, ny );
+
+        const T inv = T( 1 ) / rho;
+        T       u   = T( 0 );
+        T       v   = T( 0 );
+        for ( int k = 0; k < 3; ++k )
+        {
+            const T lambda = mu( k ) * inv;
+            u += lambda * static_cast< T >( nx[k] );
+            v += lambda * static_cast< T >( ny[k] );
+        }
+
+        const WedgeCell next = lateral_cell_from_index_coords( u, v, bounds );
+        if ( next.x == cell.x && next.y == cell.y && next.w == cell.w )
+            break; // fixed point: the remaining error is below one cell
+
+        if ( !wedge_lateral_nodes_valid( next, subdomain, lateral_valid ) )
+            break; // keep the last usable cell and let the walk deal with the neighbourhood
+
+        cell = next;
+    }
+
+    return locate_point(
+        X, subdomain, cell, coords_shell, coords_radii, bounds, max_walk_steps, eps, clamp_radially,
+        rho_clamp_min, rho_clamp_max, lateral_valid );
 }
 
 /// @brief Evaluates a Q1 scalar wedge field at reference coordinates inside a wedge cell.
