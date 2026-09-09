@@ -489,6 +489,19 @@ Result<> run( const Parameters& prm )
             prm,
             table );
         break;
+    case EnergySolverType::MMOC:
+        energy = std::make_unique< MMOCSolver< ScalarType > >(
+            domains[velocity_level],
+            coords_shell[velocity_level],
+            coords_radii[velocity_level],
+            boundary_mask_data[velocity_level],
+            ownership_mask_data[velocity_level],
+            u.block_1(),
+            T,
+            h,
+            prm,
+            table );
+        break;
     case EnergySolverType::FCT:
         energy = std::make_unique< FCTSolver< ScalarType > >(
             domains[velocity_level],

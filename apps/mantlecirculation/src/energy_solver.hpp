@@ -9,6 +9,7 @@
 #include "fe/strong_algebraic_dirichlet_enforcement.hpp"
 #include "fe/wedge/operators/shell/entropy_viscosity.hpp"
 #include "fe/wedge/operators/shell/mass.hpp"
+#include "fe/wedge/operators/shell/mmoc_transport.hpp"
 #include "fe/wedge/operators/shell/unsteady_advection_diffusion_supg.hpp"
 #include "fe/wedge/operators/shell/unsteady_advection_diffusion_supg_kerngen.hpp"
 #include "fe/wedge/operators/shell/wedge_constant_div_k_grad.hpp"
@@ -96,6 +97,36 @@ ScalarType ramp_dt( const ScalarType dt, const int timestep, const int ramp_step
         std::pow( ramp_scale_end / ramp_scale_start, static_cast< ScalarType >( timestep - 1 ) / ( ramp_steps - 1 ) );
 
     return scale * dt;
+}
+
+/// Writes the prescribed CMB and surface temperatures into `g`, zero elsewhere.
+///
+/// A free function because CUDA does not permit an extended `__host__ __device__` lambda inside a private or
+/// protected member function.
+template < typename ScalarType >
+void fill_dirichlet_temperature(
+    const grid::shell::DistributedDomain&                           domain,
+    const grid::Grid4DDataScalar< grid::shell::ShellBoundaryFlag >& boundary_mask,
+    const ScalarType                                                T_cmb,
+    const ScalarType                                                T_surface,
+    linalg::VectorQ1Scalar< ScalarType >&                           g )
+{
+    linalg::assign( g, ScalarType( 0 ) );
+
+    auto g_grid = g.grid_data();
+    auto mask   = boundary_mask;
+
+    Kokkos::parallel_for(
+        "fill_dirichlet_temperature",
+        grid::shell::local_domain_md_range_policy_nodes( domain ),
+        KOKKOS_LAMBDA( const int sd, const int x, const int y, const int r ) {
+            const auto flag = mask( sd, x, y, r );
+            if ( flag == grid::shell::ShellBoundaryFlag::CMB )
+                g_grid( sd, x, y, r ) = T_cmb;
+            else if ( flag == grid::shell::ShellBoundaryFlag::SURFACE )
+                g_grid( sd, x, y, r ) = T_surface;
+        } );
+    Kokkos::fence();
 }
 
 template < typename ScalarType >
@@ -1218,6 +1249,239 @@ class FCTSolver : public EnergySolver< ScalarType >
     linalg::VectorFVScalar< ScalarType >                T_fct_backup_;
     fv::hex::operators::FVFCTBuffers< ScalarType >      fv_fct_bufs_;
     std::vector< linalg::VectorQ1Scalar< ScalarType > > l2_proj_tmps_;
+};
+
+/// Semi-Lagrangian (MMOC) energy solve with split implicit diffusion.
+///
+/// One step is  A(dt) -> D(dt), where A is the modified method of characteristics
+/// (\ref terra::fe::wedge::operators::shell::MMOCTransport) and D is the implicit Galerkin diffusion solve.
+/// The diffusion operator is the SUPG advection-diffusion operator evaluated at zero velocity, which reduces it
+/// to  M + dt * K_diff  with the SUPG stabilisation terms (all proportional to u) vanishing identically.
+///
+/// @note This is Lie, not Strang, splitting, and deliberately so. Strang -- D(dt/2), A(dt), D(dt/2) -- is
+///       second order only if each half-step is itself at least second order in time. The diffusion solve here
+///       is backward Euler, exactly as in the SUPG and entropy-viscosity solvers, so Strang would cost a second
+///       Krylov solve per timestep and still leave the scheme first order overall. Measured on a level-4 run,
+///       the two diffusion solves were 11.19 s of an 11.25 s energy budget while the advection itself was
+///       0.062 s, so the second solve was essentially the whole cost. Should the diffusion solve ever be made
+///       Crank-Nicolson, switching to Strang would then be worth it.
+///
+/// Diffusion runs last so that the Dirichlet values at the CMB and the surface are the ones imposed at the end
+/// of the step.
+///
+/// The advection carries no numerical diffusion of its own and has no stability limit; what does limit the
+/// timestep is that a departure point must stay within the ghost layer, i.e. a Courant number below
+/// \ref MMOCTransport::max_courant.
+template < typename ScalarType >
+class MMOCSolver : public EnergySolver< ScalarType >
+{
+    using Transport   = fe::wedge::operators::shell::MMOCTransport< ScalarType >;
+    using AD          = fe::wedge::operators::shell::UnsteadyAdvectionDiffusionSUPGKerngen< ScalarType >;
+    using TempMass    = fe::wedge::operators::shell::Mass< ScalarType >;
+    using DiagSolverT = linalg::solvers::DiagonalSolver< AD >;
+    using FGMRESType  = linalg::solvers::FGMRES< AD, DiagSolverT >;
+
+  public:
+    MMOCSolver(
+        const std::shared_ptr< grid::shell::DistributedDomain >&        domain,
+        const grid::Grid3DDataVec< ScalarType, 3 >&                     coords_shell,
+        const grid::Grid2DDataScalar< ScalarType >&                     coords_radii,
+        const grid::Grid4DDataScalar< grid::shell::ShellBoundaryFlag >& boundary_mask,
+        const grid::Grid4DDataScalar< grid::NodeOwnershipFlag >&        ownership_mask,
+        const linalg::VectorQ1Vec< ScalarType, 3 >&                     velocity,
+        linalg::VectorQ1Scalar< ScalarType >&                           T,
+        ScalarType                                                      h,
+        const Parameters&                                               prm,
+        std::shared_ptr< util::Table >                                  table )
+    : domain_( domain )
+    , coords_shell_( coords_shell )
+    , coords_radii_( coords_radii )
+    , boundary_mask_( boundary_mask )
+    , ownership_mask_( ownership_mask )
+    , velocity_( velocity )
+    , T_( T )
+    , h_( h )
+    , prm_( prm )
+    , table_( std::move( table ) )
+    , transport_( *domain, ownership_mask, fe::wedge::operators::shell::TimeSteppingScheme::RK4 )
+    , u_prev_( "mmoc_u_prev", *domain, ownership_mask )
+    , u_zero_( "mmoc_u_zero", *domain, ownership_mask )
+    , g_( "mmoc_g", *domain, ownership_mask )
+    , tmp_( "mmoc_tmp", *domain, ownership_mask )
+    , q_( "mmoc_q", *domain, ownership_mask )
+    , diag_( "mmoc_diag", *domain, ownership_mask )
+    {
+        util::logroot << "Setting up MMOC energy solver ..." << std::endl;
+
+        if ( prm_.time_stepping_parameters.picard_iterations > 1 )
+            T_backup_ = linalg::VectorQ1Scalar< ScalarType >( "mmoc_T_backup", *domain_, ownership_mask_ );
+
+        linalg::assign( u_zero_, ScalarType( 0 ) );
+
+        // Start-up: with no previous velocity available, treat the flow as steady over the first step.
+        copy_velocity( velocity_, u_prev_ );
+
+        const auto kappa = prm_.physics_parameters.thermal_diffusivity_nondim;
+
+        A_ = std::make_unique< AD >( *domain_, coords_shell_, coords_radii_, boundary_mask_, u_zero_, kappa,
+                                     ScalarType( 0 ), /*treat_boundary=*/true );
+        A_neumann_ = std::make_unique< AD >( *domain_, coords_shell_, coords_radii_, boundary_mask_, u_zero_,
+                                             kappa, ScalarType( 0 ), /*treat_boundary=*/false );
+        A_neumann_diag_ = std::make_unique< AD >( *domain_, coords_shell_, coords_radii_, boundary_mask_,
+                                                  u_zero_, kappa, ScalarType( 0 ), /*treat_boundary=*/false,
+                                                  /*diagonal=*/true );
+
+        M_ = std::make_unique< TempMass >( *domain_, coords_shell_, coords_radii_, false );
+
+        constexpr int num_gmres_tmps = 14;
+        tmp_gmres_.reserve( num_gmres_tmps );
+        for ( int i = 0; i < num_gmres_tmps; ++i )
+            tmp_gmres_.emplace_back( "tmp_mmoc_gmres", *domain_, ownership_mask_ );
+
+        solver_ = std::make_unique< FGMRESType >(
+            tmp_gmres_,
+            linalg::solvers::FGMRESOptions{
+                .restart                     = prm_.energy_solver_parameters.krylov_restart,
+                .relative_residual_tolerance = prm_.energy_solver_parameters.krylov_relative_tolerance,
+                .absolute_residual_tolerance = prm_.energy_solver_parameters.krylov_absolute_tolerance,
+                .max_iterations              = prm_.energy_solver_parameters.krylov_max_iterations },
+            table_,
+            DiagSolverT( diag_ ) );
+
+        util::logroot << "MMOC energy solver ready (max Courant " << Transport::max_courant() << ")."
+                      << std::endl;
+    }
+
+    ScalarType compute_dt( const int timestep ) override
+    {
+        const auto max_vel = kernels::common::max_vector_magnitude( velocity_.grid_data() );
+
+        // Diffusion is implicit, and the characteristic tracing is unconditionally stable; the bound is that
+        // the departure point must stay inside the ghost layer.
+        const auto dt_courant = Transport::max_courant() * h_ / max_vel;
+        const auto dt_cfl     = std::min(
+            static_cast< ScalarType >( prm_.time_stepping_parameters.dt_scaling ) * h_ / max_vel, dt_courant );
+
+        const auto dt = std::clamp(
+            ramp_dt( dt_cfl, timestep, prm_.time_stepping_parameters.initial_dt_ramp_steps ),
+            static_cast< ScalarType >( prm_.time_stepping_parameters.dt_min ),
+            static_cast< ScalarType >( prm_.time_stepping_parameters.dt_max ) );
+
+        util::logroot << "Computing dt (MMOC, ghost-layer Courant bound) ..." << std::endl;
+        log_timestep_info( prm_, timestep, max_vel, h_, dt_cfl, dt );
+
+        return dt;
+    }
+
+    void snapshot_for_picard() override
+    {
+        // Called once per timestep, before the Picard loop and before this timestep's Stokes solve, so the
+        // velocity still holds u^n here -- exactly the field the characteristic tracing needs to interpolate
+        // in time against u^{n+1}.
+        copy_velocity( velocity_, u_prev_ );
+
+        if ( prm_.time_stepping_parameters.picard_iterations > 1 )
+            Kokkos::deep_copy( T_backup_.grid_data(), T_.grid_data() );
+    }
+
+    void restore_for_picard() override { Kokkos::deep_copy( T_.grid_data(), T_backup_.grid_data() ); }
+
+    void step( ScalarType dt, bool print_convergence ) override
+    {
+        util::Timer timer_energy( "energy" );
+
+        const int substeps = Transport::substeps_for_accuracy(
+            static_cast< ScalarType >( prm_.time_stepping_parameters.dt_scaling ) );
+
+        transport_.step( T_, velocity_, u_prev_, dt, substeps );
+        diffuse( dt, print_convergence );
+
+        if ( transport_.last_escapes() > 0 )
+        {
+            // Two causes, distinguishable by whether the count grows with dt: a Courant number above
+            // max_courant(), or the degenerate corner regions at the twelve pentagonal points of the
+            // icosahedral grid and at subdomain corners, whose count is independent of dt.
+            util::logroot << "    NOTE: " << transport_.last_escapes()
+                          << " departure points left the ghost layer and kept their previous value. If this "
+                             "count grows with dt, lower dt_scaling below "
+                          << Transport::max_courant()
+                          << "; if it is constant, it is the fixed set of degenerate corner regions."
+                          << std::endl;
+            for ( const auto& loc : transport_.last_escape_locations() )
+            {
+                util::logroot << "      escaped node: sd=" << loc[0] << " (" << loc[1] << "," << loc[2] << ","
+                              << loc[3] << ")" << std::endl;
+            }
+        }
+    }
+
+  private:
+    /// Component-wise copy: the vector grid data is stored as separate views per component (SoA), so a single
+    /// Kokkos::deep_copy does not apply.
+    static void copy_velocity(
+        const linalg::VectorQ1Vec< ScalarType, 3 >& src,
+        linalg::VectorQ1Vec< ScalarType, 3 >&       dst )
+    {
+        for ( int d = 0; d < 3; ++d )
+            Kokkos::deep_copy( dst.grid_data().comp_[d], src.grid_data().comp_[d] );
+    }
+
+    void diffuse( const ScalarType dt, const bool print_convergence )
+    {
+        A_->dt()              = dt;
+        A_neumann_->dt()      = dt;
+        A_neumann_diag_->dt() = dt;
+
+        {
+            linalg::VectorQ1Scalar< ScalarType > ones( "ones", *domain_, ownership_mask_ );
+            linalg::assign( ones, ScalarType( 1 ) );
+            linalg::apply( *A_neumann_diag_, ones, diag_ );
+            linalg::invert_entries( diag_ );
+        }
+
+        linalg::apply( *M_, T_, q_ );
+
+        fill_dirichlet_temperature(
+            *domain_,
+            boundary_mask_,
+            static_cast< ScalarType >( prm_.boundary_parameters.temperature_max ),
+            static_cast< ScalarType >( prm_.boundary_parameters.temperature_min ),
+            g_ );
+
+        fe::strong_algebraic_dirichlet_enforcement_poisson_like(
+            *A_neumann_, *A_neumann_diag_, g_, tmp_, q_, boundary_mask_, grid::shell::ShellBoundaryFlag::BOUNDARY );
+
+        solve( *solver_, *A_, T_, q_ );
+
+        if ( print_convergence )
+        {
+            util::logroot << "[MMOC diffusion FGMRES convergence]" << std::endl;
+            table_->query_rows_equals( "tag", "fgmres_solver" ).print_pretty();
+        }
+        table_->clear();
+    }
+
+    std::shared_ptr< grid::shell::DistributedDomain >               domain_;
+    const grid::Grid3DDataVec< ScalarType, 3 >&                     coords_shell_;
+    const grid::Grid2DDataScalar< ScalarType >&                     coords_radii_;
+    const grid::Grid4DDataScalar< grid::shell::ShellBoundaryFlag >& boundary_mask_;
+    const grid::Grid4DDataScalar< grid::NodeOwnershipFlag >&        ownership_mask_;
+    const linalg::VectorQ1Vec< ScalarType, 3 >&                     velocity_;
+    linalg::VectorQ1Scalar< ScalarType >&                           T_;
+    ScalarType                                                      h_;
+    const Parameters&                                               prm_;
+    std::shared_ptr< util::Table >                                  table_;
+
+    Transport                            transport_;
+    linalg::VectorQ1Vec< ScalarType, 3 > u_prev_;
+    linalg::VectorQ1Vec< ScalarType, 3 > u_zero_;
+
+    std::unique_ptr< AD >                               A_, A_neumann_, A_neumann_diag_;
+    std::unique_ptr< TempMass >                         M_;
+    std::unique_ptr< FGMRESType >                       solver_;
+    linalg::VectorQ1Scalar< ScalarType >                g_, tmp_, q_, diag_;
+    linalg::VectorQ1Scalar< ScalarType >                T_backup_;
+    std::vector< linalg::VectorQ1Scalar< ScalarType > > tmp_gmres_;
 };
 
 } // namespace terra::mantlecirculation

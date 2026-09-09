@@ -297,6 +297,7 @@ enum class EnergySolverType
     FCT,
     SUPG,
     ENTROPY_VISCOSITY,
+    MMOC,
 };
 struct EnergySolverParameters
 {
@@ -886,6 +887,7 @@ inline util::Result< std::variant< CLIHelp, Parameters > > parse_parameters( int
         { "supg", EnergySolverType::SUPG },
         { "entropy_viscosity", EnergySolverType::ENTROPY_VISCOSITY },
         { "ev", EnergySolverType::ENTROPY_VISCOSITY },
+        { "mmoc", EnergySolverType::MMOC },
     };
 
     add_option_with_default( app, "--energy-solver", parameters.energy_solver_parameters.energy_solver )
