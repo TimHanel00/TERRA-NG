@@ -245,7 +245,7 @@ int test( const int level )
     constexpr int vtk_interval = 10;
     io::XDMFOutput xdmf( "test_ev_rotation_out", domain, coords_shell, coords_radii );
     xdmf.add( T.grid_data() );
-    xdmf.write();
+    xdmf.write( 0 );
 
     util::logroot << "Running EV rotation test"
                   << "  level=" << level << "  dt=" << dt
@@ -314,13 +314,13 @@ int test( const int level )
 
         if ( ts % vtk_interval == 0 )
         {
-            xdmf.write();
+            xdmf.write( ts );
             util::logroot << "  ts=" << ts << "  t=" << ts * dt
                           << "  l2_rel_err=" << l2_rel_err
                           << "  T_min=" << t_min_step << "  T_max=" << t_max_step << "\n";
         }
     }
-    xdmf.write();
+    xdmf.write( n_timesteps );
 
     const ScalarType final_l2_rel = compute_l2_relative_error_nodes( T.grid_data(), T_ref.grid_data(), mask_data );
 
