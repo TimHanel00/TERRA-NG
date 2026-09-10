@@ -40,6 +40,31 @@
 /// must remain inside the local subdomain plus its ghost layer. \ref MMOCTransport::recommended_substeps
 /// converts a Courant number into the number of substeps that keeps every substep inside that budget.
 ///
+/// **Interpolation.** The field at the foot point is evaluated with
+/// \ref terra::fe::wedge::sl::evaluate_cubic_scalar — a monotone cubic reconstruction over the structured
+/// index stencil — rather than with the Q1 shape functions of the containing wedge, because multilinear
+/// evaluation is only second order and pays that error once per timestep, which is the dominant source of
+/// numerical diffusion here. The velocity stays on \ref terra::fe::wedge::sl::evaluate_q1_vec; raising it made
+/// no measurable difference to the rotation test and costs an order of magnitude more.
+///
+/// @warning This trade is **not yet settled**, and the choice of evaluator is deliberately left visible in
+///          \ref trace so it can be flipped back. Measured on `test_mmoc_rotation` at level 5, one full
+///          revolution of the cone: the cubic retains far more of the peak (0.64 versus 0.13 of the exact 1.0,
+///          i.e. much less numerical diffusion, which is what it was introduced for) but its L2 error against
+///          the exact solution is worse (1.79 versus 0.90). The reason shows up in the linear-field test: a
+///          field \f$ a + b z \f$ is reproduced by the Q1 wedge evaluation to round-off — the Q1 map *is* the
+///          geometric map, so it is exact for anything linear in \f$ x \f$ — whereas the cubic converges on it
+///          at only about order 1.4 (3.6e-2, 1.4e-2, 5.2e-3 at levels 3, 4, 5). A tensor-product stencil in
+///          index space presumes the field is a smooth function of the indices, and on this grid it is not
+///          smooth enough: the map kinks where a stencil crosses into a neighbouring diamond (confining the
+///          stencil to the owned block, as it now is, already recovered a factor of ten) and the recursive
+///          bisection places nodes off any smooth parametrisation at \f$ \mathcal{O}(h^2) \f$. Neither
+///          limiter is implicated — both the PCHIP sweep and the local range clip are inactive in these runs.
+///          Recovering the order properly needs a reconstruction that is exact for polynomials in the physical
+///          coordinates, e.g. a least-squares fit over the stencil in a local tangent frame with the
+///          coefficients precomputed per cell.
+///
+///
 /// Diffusion is not part of this operator; combine it with an implicit diffusion solve by operator splitting.
 
 namespace terra::fe::wedge::operators::shell
@@ -329,6 +354,25 @@ class MMOCTransport
 
                 Vec3 X = p * radii_g( sd, gr );
 
+                // Stencil the cubic interpolation may read from. Laterally it is the owned block only: a
+                // lateral ghost row holds a neighbour's real values, but it belongs to another diamond, and
+                // the index-space parametrisation kinks at that seam -- a stencil straddling it is
+                // inconsistent, not just less accurate. Radially the ghost layers outside the CMB and the
+                // surface exist only so that the radii array stays monotone; they hold extrapolated radii and
+                // no field data at all, so trim them off too. In both directions the window then slides
+                // inwards near the edge (one-sided but never extrapolating), and a foot point that lands
+                // outside the range altogether falls back to the Q1 evaluation.
+                sl::StencilBounds stencil{ { sl::ghost_width, n_lat_g - 1 - sl::ghost_width },
+                                           { sl::ghost_width, n_lat_g - 1 - sl::ghost_width },
+                                           { 0, n_rad_g - 1 } };
+                {
+                    const ScalarType r_tol = ScalarType( 1e-12 ) * r_max;
+                    while ( stencil.r.lo < stencil.r.hi && radii_g( sd, stencil.r.lo ) < r_min - r_tol )
+                        ++stencil.r.lo;
+                    while ( stencil.r.hi > stencil.r.lo && radii_g( sd, stencil.r.hi ) > r_max + r_tol )
+                        --stencil.r.hi;
+                }
+
                 // Seed with a cell all of whose nodes are owned: it always contains this node as a vertex,
                 // and it can never be one of the degenerate ghost-corner wedges.
                 sl::WedgeCell cell{ sl::to_ghosted_index( Kokkos::min( x, n_lat_owned - 2 ) ),
@@ -360,6 +404,9 @@ class MMOCTransport
                         }
                         cell = res.cell;
 
+                        // The velocity is smooth by construction, so it is interpolated with the unlimited
+                        // cubic: an error here displaces the foot point and enters T just as directly as an
+                        // error in T itself, and a limiter could only cost accuracy.
                         const auto u_new_s =
                             sl::evaluate_q1_vec< ScalarType, 3 >( u_g, sd, res.cell, res.xi, res.eta, res.zeta );
                         const auto u_old_s = sl::evaluate_q1_vec< ScalarType, 3 >(
@@ -389,8 +436,9 @@ class MMOCTransport
 
                     if ( res.found )
                     {
-                        const ScalarType value =
-                            sl::evaluate_q1_scalar( T_g, sd, res.cell, res.xi, res.eta, res.zeta );
+                        const ScalarType value = sl::evaluate_cubic_scalar(
+                            T_g, sd, res.cell, res.xi, res.eta, res.zeta, radii_g, stencil, lateral_valid,
+                            /*monotone=*/true );
                         T_new( sd, x, y, r ) = Kokkos::clamp( value, t_min, t_max );
                         return;
                     }
@@ -403,7 +451,8 @@ class MMOCTransport
                 {
                     ScalarType xi = 0, eta = 0, zeta = 0;
                     sl::clamp_to_wedge( X, sd, cell, lateral, radii_g, xi, eta, zeta );
-                    const ScalarType value = sl::evaluate_q1_scalar( T_g, sd, cell, xi, eta, zeta );
+                    const ScalarType value = sl::evaluate_cubic_scalar(
+                        T_g, sd, cell, xi, eta, zeta, radii_g, stencil, lateral_valid, /*monotone=*/true );
                     T_new( sd, x, y, r )   = Kokkos::clamp( value, t_min, t_max );
                 }
                 esc += 1;

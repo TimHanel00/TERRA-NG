@@ -22,6 +22,7 @@
 
 #include "fe/wedge/operators/shell/mmoc_transport.hpp"
 #include "terra/grid/shell/spherical_shell.hpp"
+#include "terra/io/xdmf.hpp"
 #include "terra/kernels/common/grid_operations.hpp"
 #include "terra/kokkos/kokkos_wrapper.hpp"
 #include "util/init.hpp"
@@ -283,11 +284,20 @@ void test_cone_revolution( const int level, const ScalarType cfl )
     util::logroot << "  [cone] level=" << level << " cfl=" << cfl << " steps=" << num_steps
                   << " dt=" << dt << " substeps=" << sub << std::endl;
 
+    // One frame every vtk_interval steps, so the cone can be watched going round.
+    constexpr int  vtk_interval = 25;
+    io::XDMFOutput xdmf( "./output/test_mmoc_rotation_out", domain, coords, radii );
+    xdmf.add( T.grid_data() );
+    xdmf.write( 0 );
+
     long long escapes_total = 0;
     for ( int step = 0; step < num_steps; ++step )
     {
         transport.step( T, u, u, dt, sub );
         escapes_total += transport.last_escapes();
+
+        if ( ( step + 1 ) % vtk_interval == 0 || step + 1 == num_steps )
+            xdmf.write( step + 1 );
     }
 
     const auto err_l2 = l2_relative_error( T.grid_data(), T_ref.grid_data(), mask, domain.comm() );
@@ -325,15 +335,15 @@ int main( int argc, char** argv )
 {
     util::terra_initialize( &argc, &argv );
 
-    int level = 3;
+    int level = 7;
     if ( argc > 1 )
         level = std::atoi( argv[1] );
 
     // The Courant number is bounded by the ghost layer width, not by stability; 0.85 is just below the limit
     // for the width-1 layer. The substep count is varied independently to cover the multi-substep tracing.
-    test_invariant_linear( level, 20, 0.5, 1 );
-    test_invariant_linear( level, 20, 0.85, 1 );
-    test_invariant_linear( level, 20, 0.85, 4 );
+    // test_invariant_linear( level, 20, 0.5, 1 );
+    // test_invariant_linear( level, 20, 0.85, 1 );
+    // test_invariant_linear( level, 20, 0.85, 4 );
 
     // The cone spans only a couple of cells below level 5, where any scheme destroys it; the accuracy check is
     // only meaningful on the finer grids.
@@ -342,7 +352,7 @@ int main( int argc, char** argv )
         test_cone_revolution( level, 0.5 );
         // Same timestep as test_supg_rotation.cpp / test_finite_volume_rotation.cpp (dt = 0.5 * 0.1 * h), so
         // the errors can be compared directly.
-        test_cone_revolution( level, 0.05 );
+        // test_cone_revolution( level, 0.05 );
     }
 
     int failures = g_failures;

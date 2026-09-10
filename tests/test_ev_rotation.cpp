@@ -243,7 +243,7 @@ int test( const int level )
     const fe::wedge::operators::shell::EntropyViscosityParameters< ScalarType > ev_params{};
 
     constexpr int vtk_interval = 10;
-    io::XDMFOutput xdmf( "test_ev_rotation_out", domain, coords_shell, coords_radii );
+    io::XDMFOutput xdmf( "./output/test_ev_rotation_out", domain, coords_shell, coords_radii );
     xdmf.add( T.grid_data() );
     xdmf.write( 0 );
 
@@ -355,5 +355,5 @@ int test( const int level )
 int main( int argc, char** argv )
 {
     util::terra_initialize( &argc, &argv );
-    return test( 5 );
+    return test( 7 );
 }

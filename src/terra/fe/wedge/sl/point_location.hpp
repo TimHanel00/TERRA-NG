@@ -12,6 +12,13 @@
 ///
 /// Point location and evaluation of Q1 wedge fields at arbitrary physical points.
 ///
+/// Two evaluators are offered once a point has been located: \ref evaluate_q1_scalar / \ref evaluate_q1_vec use
+/// the Q1 wedge shape functions of the containing cell and are second order, and \ref evaluate_cubic_scalar /
+/// \ref evaluate_cubic_vec reconstruct the field with a tensor product of monotone (PCHIP-limited) cubics over
+/// the structured index stencil around the cell, which is third order. A semi-Lagrangian scheme commits its
+/// interpolation error afresh at every timestep, where it shows up as numerical diffusion, so the cubic is what
+/// the transport uses.
+///
 /// This is the geometric core of the semi-Lagrangian (MMOC) transport scheme. It exploits the fact that the
 /// shell mesh is a tensor product of a laterally triangulated sphere and a set of radial shells, so that the
 /// wedge geometric map
@@ -745,6 +752,405 @@ KOKKOS_INLINE_FUNCTION dense::Vec< T, VecDim > evaluate_q1_vec(
         {
             value( d ) += field( subdomain, nx[lateral], ny[lateral], cell.r + radial, d ) * weight;
         }
+    }
+    return value;
+}
+
+/// @brief Number of nodes in a full cubic interpolation stencil.
+inline constexpr int cubic_stencil_size = 4;
+
+/// @brief Inclusive node index range that an interpolation stencil may read from, in one direction.
+struct StencilRange
+{
+    int lo = 0;
+    int hi = 0;
+};
+
+/// @brief Node index ranges the cubic interpolation stencil may read from.
+///
+/// Both lateral ranges should be the **owned** block, not the ghosted index space. A lateral ghost row does
+/// carry a neighbour's real values, but it belongs to a different diamond of the icosahedral grid, and the map
+/// from index space to the sphere has a kink at that seam: the neighbour's index directions meet ours at an
+/// angle. A stencil straddling the seam therefore estimates its slopes across a corner of the parametrisation
+/// and is not merely less accurate but inconsistent — measured at level 4 it costs about 1e-1 on a field the
+/// Q1 evaluation reproduces to round-off. Confining the stencil to one diamond keeps the parametrisation
+/// smooth; foot points that land outside the owned block fall back to Q1.
+///
+/// The radial range must be trimmed for a different reason: the radial ghost layers outside the CMB and the
+/// surface hold extrapolated *radii* and no field data at all (see
+/// \ref terra::fe::wedge::sl::ghosted_shell_radii), and reading them would poison the interpolation of every
+/// node in the boundary layer.
+struct StencilBounds
+{
+    StencilRange x;
+    StencilRange y;
+    StencilRange r;
+};
+
+/// @brief Stencil bounds spanning a whole index space, with no direction trimmed.
+KOKKOS_INLINE_FUNCTION StencilBounds full_stencil_bounds( const IndexBounds& bounds )
+{
+    return StencilBounds{ { 0, bounds.num_nodes_x - 1 },
+                          { 0, bounds.num_nodes_y - 1 },
+                          { 0, bounds.num_nodes_r - 1 } };
+}
+
+/// @brief Places an interpolation stencil of up to \ref cubic_stencil_size nodes around a cell.
+///
+/// The cell spans nodes `cell_index` and `cell_index + 1`, both of which are assumed to lie in `range`. The
+/// stencil is centred on the cell (`base = cell_index - 1`) wherever there is room, and slid inwards where
+/// there is not — near a boundary the interpolation becomes one-sided rather than reaching outside, which is
+/// what keeps the evaluation point inside the stencil's span (no extrapolation) at the price of a larger error
+/// constant. If fewer than four nodes are available the stencil shrinks to three (quadratic) or two (linear).
+///
+/// @return the number of stencil nodes, `base .. base + n - 1`.
+KOKKOS_INLINE_FUNCTION int cubic_stencil_window( const int cell_index, const StencilRange& range, int& base )
+{
+    const int available = range.hi - range.lo + 1;
+    // Compared rather than passed to Kokkos::min: binding a namespace-scope constexpr to a reference odr-uses
+    // it, which nvcc rejects in device code.
+    const int n         = ( available < cubic_stencil_size ) ? available : cubic_stencil_size;
+
+    base = Kokkos::clamp( ( n >= 3 ) ? cell_index - 1 : cell_index, range.lo, range.hi - n + 1 );
+    return n;
+}
+
+/// @brief Piecewise cubic Hermite interpolation through up to four nodes, optionally PCHIP-limited.
+///
+/// The nodal derivatives are the three-point parabolic estimates (the centred difference for equally spaced
+/// nodes) with the usual one-sided parabola at the two ends, which makes the interpolant \f$ C^1 \f$ and third
+/// order accurate — a decisive improvement over the second-order multilinear evaluation for a semi-Lagrangian
+/// scheme, where the interpolation error is applied afresh every timestep and shows up as numerical diffusion.
+///
+/// With `monotone` set, the derivatives are then passed through the Fritsch–Carlson limiter: zero the slope at
+/// a local extremum of the data, and otherwise cap it at three times the smaller neighbouring secant. That is
+/// the PCHIP construction, and it makes the interpolant monotone on every interval where the data is, so a
+/// sharp jump — a thermal boundary layer, a plume front — produces no over- or undershoot. The price is the
+/// usual one: a smooth extremum is also flattened, so the order drops to two in the few cells around a peak.
+/// Leave it off for fields that are smooth by construction (a Stokes velocity), keep it on for the transported
+/// scalar.
+///
+/// `xs` must be strictly increasing and `xq` should lie within `xs[0] .. xs[n - 1]`; a query outside is
+/// evaluated on the nearest interval's cubic, i.e. extrapolated.
+template < typename T >
+KOKKOS_INLINE_FUNCTION T pchip_interpolate_1d( const T* xs, const T* fs, const int n, const T xq, const bool monotone )
+{
+    if ( n <= 1 )
+        return fs[0];
+
+    T h[cubic_stencil_size - 1];
+    T d[cubic_stencil_size - 1];
+    for ( int k = 0; k < n - 1; ++k )
+    {
+        h[k] = xs[k + 1] - xs[k];
+        d[k] = ( fs[k + 1] - fs[k] ) / h[k];
+    }
+
+    T m[cubic_stencil_size];
+    if ( n == 2 )
+    {
+        m[0] = d[0];
+        m[1] = d[0];
+    }
+    else
+    {
+        for ( int k = 1; k < n - 1; ++k )
+            m[k] = ( d[k - 1] * h[k] + d[k] * h[k - 1] ) / ( h[k - 1] + h[k] );
+
+        // One-sided ends: the slope of the parabola through the first (last) three nodes.
+        m[0]     = ( d[0] * ( T( 2 ) * h[0] + h[1] ) - d[1] * h[0] ) / ( h[0] + h[1] );
+        m[n - 1] = ( d[n - 2] * ( T( 2 ) * h[n - 2] + h[n - 3] ) - d[n - 3] * h[n - 2] ) / ( h[n - 2] + h[n - 3] );
+    }
+
+    if ( monotone )
+    {
+        for ( int k = 0; k < n; ++k )
+        {
+            // At the ends both neighbouring secants collapse onto the single adjacent one, which reduces the
+            // rule below to the standard PCHIP endpoint limiter.
+            const T dl = d[( k > 0 ) ? k - 1 : 0];
+            const T dr = d[( k < n - 1 ) ? k : n - 2];
+
+            if ( dl * dr <= T( 0 ) )
+            {
+                m[k] = T( 0 );
+            }
+            else if ( m[k] * dl < T( 0 ) )
+            {
+                m[k] = T( 0 );
+            }
+            else
+            {
+                // dl and dr share a sign here, and m[k] now shares it too, so one clamp suffices.
+                const T limit = T( 3 ) * Kokkos::min( Kokkos::abs( dl ), Kokkos::abs( dr ) );
+                m[k] = ( dl > T( 0 ) ) ? Kokkos::min( m[k], limit ) : Kokkos::max( m[k], -limit );
+            }
+        }
+    }
+
+    int k = 0;
+    while ( k < n - 2 && xq > xs[k + 1] )
+        ++k;
+
+    const T hk = h[k];
+    const T s  = ( xq - xs[k] ) / hk;
+    const T s2 = s * s;
+    const T s3 = s2 * s;
+
+    return ( T( 2 ) * s3 - T( 3 ) * s2 + T( 1 ) ) * fs[k] + ( s3 - T( 2 ) * s2 + s ) * hk * m[k] +
+           ( -T( 2 ) * s3 + T( 3 ) * s2 ) * fs[k + 1] + ( s3 - s2 ) * hk * m[k + 1];
+}
+
+/// @brief Continuous lateral index coordinates of a point given by wedge reference coordinates.
+///
+/// The barycentric coordinates of either triangle of a hex cell map onto the cell's index square exactly:
+/// with \f$ \lambda = (1 - \xi - \eta, \xi, \eta) \f$ and the node indices of \ref wedge_lateral_node_indices,
+/// \f$ (u, v) = \sum_k \lambda_k (n^x_k, n^y_k) \f$ collapses to \f$ (x + \xi, y + \eta) \f$ for `w == 0` and to
+/// \f$ (x + 1 - \xi, y + 1 - \eta) \f$ for `w == 1`. Both land in \f$ [x, x+1] \times [y, y+1] \f$, so the
+/// triangulation inside the hex cell is irrelevant to where the point is — which is exactly what lets a
+/// structured stencil be laid over the lateral index space.
+template < typename T >
+KOKKOS_INLINE_FUNCTION void wedge_lateral_index_coords(
+    const WedgeCell& cell,
+    const T          xi,
+    const T          eta,
+    T&               u,
+    T&               v )
+{
+    u = ( cell.w == 0 ) ? static_cast< T >( cell.x ) + xi : static_cast< T >( cell.x + 1 ) - xi;
+    v = ( cell.w == 0 ) ? static_cast< T >( cell.y ) + eta : static_cast< T >( cell.y + 1 ) - eta;
+}
+
+/// @brief Cone radius of a point given by its radial cell and reference coordinate.
+template < typename T, typename CoordsRadiiType >
+KOKKOS_INLINE_FUNCTION T wedge_radius_from_zeta(
+    const int              subdomain,
+    const WedgeCell&       cell,
+    const CoordsRadiiType& coords_radii,
+    const T                zeta )
+{
+    const T r1 = coords_radii( subdomain, cell.r );
+    const T r2 = coords_radii( subdomain, cell.r + 1 );
+    return r1 + T( 0.5 ) * ( zeta + T( 1 ) ) * ( r2 - r1 );
+}
+
+/// @brief True if the cell spanning nodes `cell_index, cell_index + 1` lies wholly inside `range`.
+///
+/// Guards against evaluating the stencil polynomial outside its own span: a cubic extrapolated even one cell is
+/// far worse than a linear evaluation inside the cell, so a point outside the stencil's range is handed back to
+/// the Q1 evaluator instead.
+KOKKOS_INLINE_FUNCTION bool cell_inside_stencil_range( const int cell_index, const StencilRange& range )
+{
+    return cell_index >= range.lo && cell_index + 1 <= range.hi;
+}
+
+/// @brief True if every lateral node of a `nu x nv` stencil anchored at `(bx, by)` carries usable geometry.
+template < typename LateralValidityType >
+KOKKOS_INLINE_FUNCTION bool cubic_stencil_lateral_valid(
+    const int                  subdomain,
+    const int                  bx,
+    const int                  by,
+    const int                  nu,
+    const int                  nv,
+    const LateralValidityType& lateral_valid )
+{
+    for ( int j = 0; j < nv; ++j )
+        for ( int i = 0; i < nu; ++i )
+            if ( lateral_valid( subdomain, bx + i, by + j ) == 0 )
+                return false;
+    return true;
+}
+
+/// @brief Range of a scalar field over the eight nodes of one wedge cell's hex cell.
+///
+/// The local bound for a semi-Lagrangian limiter: the departure point lies inside this cell, so a transported
+/// value outside the range of its corners is a new extremum invented by the reconstruction.
+template < typename T, typename FieldViewType >
+KOKKOS_INLINE_FUNCTION void cell_value_range(
+    const FieldViewType& field,
+    const int            subdomain,
+    const WedgeCell&     cell,
+    T&                   lo,
+    T&                   hi )
+{
+    lo = field( subdomain, cell.x, cell.y, cell.r );
+    hi = lo;
+
+    for ( int k = 0; k < 2; ++k )
+        for ( int j = 0; j < 2; ++j )
+            for ( int i = 0; i < 2; ++i )
+            {
+                const T v = field( subdomain, cell.x + i, cell.y + j, cell.r + k );
+                lo        = Kokkos::min( lo, v );
+                hi        = Kokkos::max( hi, v );
+            }
+}
+
+/// @brief Evaluates a scalar wedge field by monotone cubic interpolation on the structured index stencil.
+///
+/// A drop-in, higher-order replacement for \ref evaluate_q1_scalar. The multilinear Q1 evaluation is only
+/// second order, and in a semi-Lagrangian scheme that error is committed once per timestep and accumulates as
+/// numerical diffusion; this instead reconstructs the field with a tensor product of the \f$ C^1 \f$,
+/// PCHIP-limited cubics of \ref pchip_interpolate_1d, laterally over the \f$ (x, y) \f$ index grid and radially
+/// over the shell radii.
+///
+/// Laterally the stencil is uniform in index space (the map from index space to the sphere is smooth, so the
+/// field is a smooth function of the indices and interpolating there is legitimate); radially it uses the
+/// actual node radii, so non-uniform layer thicknesses are handled exactly.
+///
+/// **Boundaries.** `stencil` states which nodes may be read. Where the four-node window does not fit — against
+/// the radial ends of the shell, or against the edge of the ghost layer — it is slid inwards instead of being
+/// allowed to reach outside, so the interpolation stays one-sided but never extrapolates. Where the window
+/// would cover one of the degenerate diagonal ghost corners of the icosahedral grid (see
+/// \ref terra::fe::wedge::sl::ghosted_lateral_validity) there is no usable structured neighbourhood at all, and
+/// the evaluation falls back to \ref evaluate_q1_scalar on the located wedge, whose three lateral nodes the
+/// point location has already vetted. That affects at most the four hex cells at each corner of a subdomain.
+///
+/// **The local bound.** With `monotone` set the result cannot leave the range of the eight nodes of the cell
+/// that contains the point — the property Q1 has for free (it is a convex combination of those nodal values),
+/// and the one a semi-Lagrangian step needs: a value outside that range is a new extremum the transport then
+/// has to carry, and an undershoot below the global minimum is clipped away by the caller's range clip, which
+/// *adds* mass and over hundreds of steps ratchets into a spurious halo around every sharp feature.
+///
+/// For a foot point that lies **inside** its cell the sweeps already deliver this, and the clip below is a
+/// no-op: the query then lands in the cell's own bracketing interval in each direction — \f$ u \in [x, x+1] \f$,
+/// \f$ v \in [y, y+1] \f$, and \f$ \rho \f$ between the cell's two shell radii — and on that interval the
+/// Fritsch–Carlson limiter of \ref pchip_interpolate_1d holds the Hermite cubic between the interval's two
+/// endpoint values, a bound that composes across the three sweeps.
+///
+/// What the clip is actually for is a foot point that has **drifted out** of its cell. \ref locate_point
+/// reports \f$ \xi, \eta, \zeta \f$ straight from the closed-form inverse and does not clamp them onto the
+/// reference wedge, so a departure point can arrive here sitting in a neighbouring cell of the same stencil.
+/// Each sweep is then bounded by *that* interval's nodes instead, and the value can leave the range of the
+/// data the located cell holds. The result is therefore clipped into the range of the cell's own eight nodes
+/// (\ref cell_value_range), the classical Bermejo–Staniforth filter, which restores the bound in that case
+/// too. Without `monotone` neither half applies and the reconstruction does overshoot.
+template < typename T, typename FieldViewType, typename CoordsRadiiType, typename LateralValidityType >
+KOKKOS_INLINE_FUNCTION T evaluate_cubic_scalar(
+    const FieldViewType&       field,
+    const int                  subdomain,
+    const WedgeCell&           cell,
+    const T                    xi,
+    const T                    eta,
+    const T                    zeta,
+    const CoordsRadiiType&     coords_radii,
+    const StencilBounds&       stencil,
+    const LateralValidityType& lateral_valid,
+    const bool                 monotone = true )
+{
+    if ( !cell_inside_stencil_range( cell.x, stencil.x ) || !cell_inside_stencil_range( cell.y, stencil.y ) ||
+         !cell_inside_stencil_range( cell.r, stencil.r ) )
+        return evaluate_q1_scalar( field, subdomain, cell, xi, eta, zeta );
+
+    int       bx = 0, by = 0, br = 0;
+    const int nu = cubic_stencil_window( cell.x, stencil.x, bx );
+    const int nv = cubic_stencil_window( cell.y, stencil.y, by );
+    const int nr = cubic_stencil_window( cell.r, stencil.r, br );
+
+    if ( !cubic_stencil_lateral_valid( subdomain, bx, by, nu, nv, lateral_valid ) )
+        return evaluate_q1_scalar( field, subdomain, cell, xi, eta, zeta );
+
+    T u = T( 0 ), v = T( 0 );
+    wedge_lateral_index_coords( cell, xi, eta, u, v );
+    const T rho = wedge_radius_from_zeta( subdomain, cell, coords_radii, zeta );
+    
+    T us[cubic_stencil_size], vs[cubic_stencil_size], rs[cubic_stencil_size];
+    for ( int i = 0; i < nu; ++i )
+        us[i] = static_cast< T >( bx + i );
+    for ( int j = 0; j < nv; ++j )
+        vs[j] = static_cast< T >( by + j );
+    for ( int k = 0; k < nr; ++k )
+        rs[k] = coords_radii( subdomain, br + k );
+
+    T f_r[cubic_stencil_size];
+    for ( int k = 0; k < nr; ++k )
+    {
+        T f_v[cubic_stencil_size];
+        for ( int j = 0; j < nv; ++j )
+        {
+            T f_u[cubic_stencil_size];
+            for ( int i = 0; i < nu; ++i )
+                f_u[i] = field( subdomain, bx + i, by + j, br + k );
+
+            f_v[j] = pchip_interpolate_1d( us, f_u, nu, u, monotone );
+        }
+        f_r[k] = pchip_interpolate_1d( vs, f_v, nv, v, monotone );
+    }
+
+    const T value = pchip_interpolate_1d( rs, f_r, nr, rho, monotone );
+
+    if ( !monotone )
+        return value;
+
+    T lo = T( 0 ), hi = T( 0 );
+    cell_value_range( field, subdomain, cell, lo, hi );
+    return Kokkos::clamp( value, lo, hi );
+}
+
+/// @brief Evaluates a vector wedge field by monotone cubic interpolation on the structured index stencil.
+///
+/// Componentwise \ref evaluate_cubic_scalar; see there for the stencil and boundary handling. For a velocity
+/// this wants `monotone = false`: a velocity is smooth by construction, so the limiter can only cost accuracy.
+///
+/// @note Whether a velocity is worth reconstructing this way is not obvious and should be measured. The MMOC
+///       transport keeps its velocity on \ref evaluate_q1_vec: in the rotation test the two are
+///       indistinguishable (the rigid-rotation velocity is linear in \f$ x \f$, which Q1 reproduces exactly
+///       while this reconstruction does not), and Q1 is an order of magnitude cheaper.
+template < typename T, int VecDim, typename FieldViewType, typename CoordsRadiiType, typename LateralValidityType >
+KOKKOS_INLINE_FUNCTION dense::Vec< T, VecDim > evaluate_cubic_vec(
+    const FieldViewType&       field,
+    const int                  subdomain,
+    const WedgeCell&           cell,
+    const T                    xi,
+    const T                    eta,
+    const T                    zeta,
+    const CoordsRadiiType&     coords_radii,
+    const StencilBounds&       stencil,
+    const LateralValidityType& lateral_valid,
+    const bool                 monotone = false )
+{
+    if ( !cell_inside_stencil_range( cell.x, stencil.x ) || !cell_inside_stencil_range( cell.y, stencil.y ) ||
+         !cell_inside_stencil_range( cell.r, stencil.r ) )
+        return evaluate_q1_vec< T, VecDim >( field, subdomain, cell, xi, eta, zeta );
+
+    int       bx = 0, by = 0, br = 0;
+    const int nu = cubic_stencil_window( cell.x, stencil.x, bx );
+    const int nv = cubic_stencil_window( cell.y, stencil.y, by );
+    const int nr = cubic_stencil_window( cell.r, stencil.r, br );
+
+    if ( !cubic_stencil_lateral_valid( subdomain, bx, by, nu, nv, lateral_valid ) )
+        return evaluate_q1_vec< T, VecDim >( field, subdomain, cell, xi, eta, zeta );
+
+    T u = T( 0 ), v = T( 0 );
+    wedge_lateral_index_coords( cell, xi, eta, u, v );
+    const T rho = wedge_radius_from_zeta( subdomain, cell, coords_radii, zeta );
+
+    T us[cubic_stencil_size], vs[cubic_stencil_size], rs[cubic_stencil_size];
+    for ( int i = 0; i < nu; ++i )
+        us[i] = static_cast< T >( bx + i );
+    for ( int j = 0; j < nv; ++j )
+        vs[j] = static_cast< T >( by + j );
+    for ( int k = 0; k < nr; ++k )
+        rs[k] = coords_radii( subdomain, br + k );
+
+    dense::Vec< T, VecDim > value;
+    for ( int d = 0; d < VecDim; ++d )
+    {
+        T f_r[cubic_stencil_size];
+        for ( int k = 0; k < nr; ++k )
+        {
+            T f_v[cubic_stencil_size];
+            for ( int j = 0; j < nv; ++j )
+            {
+                T f_u[cubic_stencil_size];
+                for ( int i = 0; i < nu; ++i )
+                    f_u[i] = field( subdomain, bx + i, by + j, br + k, d );
+
+                f_v[j] = pchip_interpolate_1d( us, f_u, nu, u, monotone );
+            }
+            f_r[k] = pchip_interpolate_1d( vs, f_v, nv, v, monotone );
+        }
+        value( d ) = pchip_interpolate_1d( rs, f_r, nr, rho, monotone );
     }
     return value;
 }
