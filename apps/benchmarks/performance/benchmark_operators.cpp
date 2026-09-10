@@ -151,6 +151,7 @@ struct Parameters
     int lat_tile  = 0;
     int r_tile    = 0;
     int r_passes  = 0;
+    int y_passes  = 0;
 };
 
 // Number of untimed warmup matvecs run before the timed region (set from --warmup).
@@ -574,14 +575,20 @@ int main( int argc, char** argv )
         app, "--warmup", parameters.warmup,
         "Number of untimed warmup matvecs before the timed region (0 = none)." );
     util::add_option_with_default(
-        app, "--lat-tile", parameters.lat_tile,
-        "EpsDivDivKerngen lateral tile size override (0 = default 4)." );
+        app,
+        "--lat-tile",
+        parameters.lat_tile,
+        "EpsDivDivKerngen lateral tile size override (0 = backend/path default)." );
     util::add_option_with_default(
-        app, "--r-tile", parameters.r_tile,
-        "EpsDivDivKerngen radial tile size override (0 = default 16)." );
+        app, "--r-tile", parameters.r_tile, "EpsDivDivKerngen radial tile size override (0 = backend/path default)." );
     util::add_option_with_default(
         app, "--r-passes", parameters.r_passes,
         "EpsDivDivKerngen radial-passes override (0 = default 2)." );
+    util::add_option_with_default(
+        app,
+        "--y-passes",
+        parameters.y_passes,
+        "EpsDivDivKerngen fast Dirichlet/Neumann y passes per shared patch (0 = backend/path default)." );
     util::add_option_with_default(
         app, "--radial-extra-levels", parameters.radial_extra_levels,
         "Extra radial diamond levels on top of the loop level (rad_level = level + this); "
@@ -600,6 +607,8 @@ int main( int argc, char** argv )
     terra::fe::wedge::operators::shell::g_epsdivdiv_lat_tile_override = parameters.lat_tile;
     terra::fe::wedge::operators::shell::g_epsdivdiv_r_tile_override   = parameters.r_tile;
     terra::fe::wedge::operators::shell::g_epsdivdiv_r_passes_override = parameters.r_passes;
+
+    terra::fe::wedge::operators::shell::g_epsdivdiv_y_passes_override = parameters.y_passes;
 
     g_warmup_iterations = parameters.warmup;
 
