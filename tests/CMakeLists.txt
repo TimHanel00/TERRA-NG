@@ -122,3 +122,24 @@ add_terra_test(test_ev_advection_diffusion)
 # Adding target for all the tests.
 get_property(ALL_TERRA_TESTS GLOBAL PROPERTY TERRA_TEST_TARGETS)
 add_custom_target(tests DEPENDS ${ALL_TERRA_TESTS})
+
+add_terra_test(test_direct_diamond_routing)
+
+add_terra_test(test_mmoc_hybrid_sampling)
+add_terra_test(test_mmoc_hybrid_sampling 2)
+add_terra_test(test_mmoc_hybrid_sampling 4)
+add_test(NAME test_mmoc_hybrid_mixed_np_4 COMMAND ${MPIEXEC_EXECUTABLE} -np 4 $<TARGET_FILE:test_mmoc_hybrid_sampling> --mixed)
+add_test(NAME test_mmoc_hybrid_empty_np_4 COMMAND ${MPIEXEC_EXECUTABLE} -np 4 $<TARGET_FILE:test_mmoc_hybrid_sampling> --all-root)
+
+add_terra_test(test_mmoc_hybrid_transport)
+add_terra_test(test_mmoc_hybrid_transport 2)
+add_terra_test(test_mmoc_hybrid_transport 4)
+
+add_terra_test(test_mmoc_ghost_stencil_routing)
+add_terra_test(test_mmoc_ghost_stencil_routing 2)
+add_terra_test(test_mmoc_ghost_stencil_routing 4)
+
+add_executable(test_mmoc_transport_benchmark test_mmoc_transport_benchmark.cpp)
+target_link_libraries(test_mmoc_transport_benchmark terra MPI::MPI_CXX)
+target_include_directories(test_mmoc_transport_benchmark PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_definitions(test_mmoc_transport_benchmark PRIVATE TERRA_MMOC_HYBRID_BENCH=1)

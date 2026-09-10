@@ -1,6 +1,8 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
+#include <cstdint>
 #include <map>
 #include <tuple>
 #include <vector>
@@ -15,19 +17,9 @@
 namespace terra::communication::shell {
 
 
-// --------------------------------------------------------------------------------------
-// Reusable, precomputed plan
-// --------------------------------------------------------------------------------------
-//
-// Goal: avoid rebuilding send/recv pair lists, sorting, chunk layout, and per-rank buffer sizes
-// on every halo exchange. We do that once in the ctor, then `exchange_and_reduce(...)` just runs
-// the hot path: local copies, pack, fence, post isends/irecvs, wait, scatter, unpack.
-//
-// Notes:
-// - This keeps your existing per-boundary recv buffers intact and still used by unpack.
-// - It keeps your per-rank aggregation optimization.
-// - It does not depend on send_buffers_ (your argument is unused currently anyway).
-//
+// Cache boundary routing and buffers for repeated halo exchanges.
+// Remote data is packed per MPI rank. Local data uses per-boundary buffers by default,
+// or two batched kernels when enabled: gather sources, then reduce into destinations.
 template < class GridDataType >
 class ShellBoundaryCommPlan
 {
@@ -37,8 +29,30 @@ class ShellBoundaryCommPlan
     using memory_space          = typename GridDataType::memory_space;
     using rank_buffer_view      = Kokkos::View< ScalarType*, memory_space >;
 
-    explicit ShellBoundaryCommPlan( const grid::shell::DistributedDomain& domain, bool enable_local_comm = true )
-        : domain_( &domain ), enable_local_comm_( enable_local_comm )
+    template < bool Gather >
+    struct LocalHaloKernel
+    {
+        GridDataType data;
+        Kokkos::View< int64_t*[2], memory_space > pairs;
+        rank_buffer_view values;
+        CommunicationReduction reduction = CommunicationReduction::SUM;
+
+        KOKKOS_INLINE_FUNCTION void operator()( int64_t i ) const
+        {
+            const int n = data.extent( 1 ), nr = data.extent( 3 );
+            constexpr bool is_scalar = std::is_same_v< GridDataType, grid::Grid4DDataScalar< ScalarType > >;
+            const auto node = pairs( i / VecDim, Gather ? 0 : 1 );
+            auto& value = communication::detail::value_ref< GridDataType, is_scalar >(
+                data, node / ( nr * n * n ), ( node / ( nr * n ) ) % n, ( node / nr ) % n, node % nr, i % VecDim );
+            if constexpr ( Gather ) values( i ) = value;
+            else communication::detail::reduction_function( &value, values( i ), reduction );
+        }
+    };
+
+    // Opt-in batching replaces per-boundary local launches with one gather and one reduction.
+    explicit ShellBoundaryCommPlan(
+        const grid::shell::DistributedDomain& domain, bool enable_local_comm = true, bool batch_local_comm = false )
+        : domain_( &domain ), enable_local_comm_( enable_local_comm ), batch_local_comm_( batch_local_comm )
     {
         build_plan_();
         allocate_rank_buffers_();
@@ -60,7 +74,7 @@ class ShellBoundaryCommPlan
 
         post_isends_();
 
-        // Unpack local pairs from boundary_recv_buffers while MPI progresses.
+        // Reduce cached local boundary values while MPI progresses.
         unpack_local_( data, boundary_recv_buffers, reduction );
 
         // Waitany loop: for each remote recv as it lands, unpack its chunks
@@ -102,6 +116,98 @@ class ShellBoundaryCommPlan
         int         offset = 0; // in scalars
         int         size   = 0; // in scalars
     };
+
+    // Match the existing boundary pack/unpack orientation, once during plan construction.
+    template < typename Boundary >
+    int64_t boundary_node_( int s, Boundary boundary, int i, int j,
+                            grid::BoundaryDirection direction_0, grid::BoundaryDirection direction_1 ) const
+    {
+        const int n = domain_->domain_info().subdomain_num_nodes_per_side_laterally();
+        const int nr = domain_->domain_info().subdomain_num_nodes_radially();
+        const auto px = grid::boundary_position_from_boundary_type_x( boundary );
+        const auto py = grid::boundary_position_from_boundary_type_y( boundary );
+        const auto pr = grid::boundary_position_from_boundary_type_r( boundary );
+        int x, y, r;
+        if constexpr ( std::is_same_v< Boundary, grid::BoundaryFace > )
+        {
+            if ( px != grid::BoundaryPosition::PV )
+            {
+                x = communication::detail::idx( 0, n, px, direction_0 );
+                y = communication::detail::idx( i, n, py, direction_0 );
+                r = communication::detail::idx( j, nr, pr, direction_1 );
+            }
+            else if ( py != grid::BoundaryPosition::PV )
+            {
+                x = communication::detail::idx( i, n, px, direction_0 );
+                y = communication::detail::idx( 0, n, py, direction_0 );
+                r = communication::detail::idx( j, nr, pr, direction_1 );
+            }
+            else
+            {
+                x = communication::detail::idx( i, n, px, direction_0 );
+                y = communication::detail::idx( j, n, py, direction_1 );
+                r = communication::detail::idx( 0, nr, pr, direction_0 );
+            }
+        }
+        else
+        {
+            x = communication::detail::idx( i, n, px, direction_0 );
+            y = communication::detail::idx( i, n, py, direction_0 );
+            r = communication::detail::idx( i, nr, pr, direction_0 );
+        }
+        return ( ( int64_t( s ) * n + x ) * n + y ) * nr + r;
+    }
+
+    void build_local_node_pairs_()
+    {
+        if ( !batch_local_comm_ ) return;
+        // Cache oriented source/destination pairs once; the same device buffers serve every exchange.
+        std::vector< std::array< int64_t, 2 > > pairs;
+        const auto forward = grid::BoundaryDirection::FORWARD;
+        const int n = domain_->domain_info().subdomain_num_nodes_per_side_laterally();
+        for ( const auto& p : local_pairs_ )
+        {
+            const int source = std::get< 0 >( domain_->subdomains().at( p.neighbor_subdomain ) );
+            const int nodes = piece_num_scalars_( p ) / VecDim;
+            const auto append = [&]( auto local_boundary, auto neighbor_boundary, int ni, int nj ) {
+                for ( int i = 0; i < ni; ++i )
+                    for ( int j = 0; j < nj; ++j )
+                        pairs.push_back( {
+                            boundary_node_( source, neighbor_boundary, i, j, forward, forward ),
+                            boundary_node_( p.local_subdomain_id, local_boundary, i, j, p.direction_0, p.direction_1 ) } );
+            };
+            if ( p.boundary_type == 0 )
+                append( static_cast< grid::BoundaryVertex >( p.local_subdomain_boundary ),
+                        static_cast< grid::BoundaryVertex >( p.neighbor_subdomain_boundary ), 1, 1 );
+            else if ( p.boundary_type == 1 )
+                append( static_cast< grid::BoundaryEdge >( p.local_subdomain_boundary ),
+                        static_cast< grid::BoundaryEdge >( p.neighbor_subdomain_boundary ), nodes, 1 );
+            else
+                append( static_cast< grid::BoundaryFace >( p.local_subdomain_boundary ),
+                        static_cast< grid::BoundaryFace >( p.neighbor_subdomain_boundary ), n, nodes / n );
+        }
+        local_node_pairs_ = decltype( local_node_pairs_ )( "shell_local_node_pairs", pairs.size() );
+        auto host = Kokkos::create_mirror_view( local_node_pairs_ );
+        for ( size_t i = 0; i < pairs.size(); ++i )
+            for ( int d = 0; d < 2; ++d ) host( i, d ) = pairs[i][d];
+        Kokkos::deep_copy( local_node_pairs_, host );
+        local_values_ = rank_buffer_view( "shell_local_values", pairs.size() * VecDim );
+    }
+
+    // Gather all sources before reducing any destination; shared boundary nodes may overlap.
+    void gather_local_( const GridDataType& data ) const
+    {
+        Kokkos::parallel_for(
+            "shell_local_gather", Kokkos::RangePolicy< Kokkos::IndexType< int64_t > >( 0, local_values_.extent( 0 ) ),
+            LocalHaloKernel< true >{ data, local_node_pairs_, local_values_ } );
+    }
+
+    void reduce_local_( const GridDataType& data, CommunicationReduction reduction ) const
+    {
+        Kokkos::parallel_for(
+            "shell_local_reduce", Kokkos::RangePolicy< Kokkos::IndexType< int64_t > >( 0, local_values_.extent( 0 ) ),
+            LocalHaloKernel< false >{ data, local_node_pairs_, local_values_, reduction } );
+    }
 
     // --------------------------
     // Plan build / layout
@@ -211,6 +317,7 @@ class ShellBoundaryCommPlan
             if ( enable_local_comm_ && p.local_rank == p.neighbor_rank )
                 local_pairs_.push_back( p );
         }
+        build_local_node_pairs_();
 
         // SEND layout (sorted and chunked per rank, remote only)
         {
@@ -326,6 +433,12 @@ class ShellBoundaryCommPlan
         SubdomainNeighborhoodSendRecvBuffer< ScalarType, VecDim >& boundary_recv_buffers ) const
     {
         util::Timer timer( "ShellBoundaryCommPlan::local_comm" );
+
+        if ( batch_local_comm_ )
+        {
+            gather_local_( data );
+            return;
+        }
 
         const auto& domain = *domain_;
 
@@ -475,6 +588,12 @@ class ShellBoundaryCommPlan
     {
         util::Timer timer( "ShellBoundaryCommPlan::unpack_local" );
 
+        if ( batch_local_comm_ )
+        {
+            reduce_local_( data, reduction );
+            return;
+        }
+
         for ( const auto& p : local_pairs_ )
         {
             if ( p.boundary_type == 0 )
@@ -619,6 +738,9 @@ class ShellBoundaryCommPlan
   private:
     const grid::shell::DistributedDomain* domain_            = nullptr;
     bool                                  enable_local_comm_ = true;
+    bool                                  batch_local_comm_ = false;
+    Kokkos::View< int64_t*[2], memory_space > local_node_pairs_;
+    rank_buffer_view local_values_;
 
     // Precomputed full list
     std::vector< SendRecvPair > send_recv_pairs_;

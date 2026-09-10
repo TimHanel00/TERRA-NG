@@ -500,7 +500,8 @@ Result<> run( const Parameters& prm )
             T,
             h,
             prm,
-            table );
+            table,
+            agglom.subdomain_fn( velocity_level ) );
         break;
     case EnergySolverType::FCT:
         energy = std::make_unique< FCTSolver< ScalarType > >(

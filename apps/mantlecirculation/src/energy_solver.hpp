@@ -1269,9 +1269,8 @@ class FCTSolver : public EnergySolver< ScalarType >
 /// Diffusion runs last so that the Dirichlet values at the CMB and the surface are the ones imposed at the end
 /// of the step.
 ///
-/// The advection carries no numerical diffusion of its own and has no stability limit; what does limit the
-/// timestep is that a departure point must stay within the ghost layer, i.e. a Courant number below
-/// \ref MMOCTransport::max_courant.
+/// Owner-routed sampling permits departure points beyond the ghost layer. User timestep limits and
+/// trajectory-accuracy substepping still apply.
 template < typename ScalarType >
 class MMOCSolver : public EnergySolver< ScalarType >
 {
@@ -1292,7 +1291,8 @@ class MMOCSolver : public EnergySolver< ScalarType >
         linalg::VectorQ1Scalar< ScalarType >&                           T,
         ScalarType                                                      h,
         const Parameters&                                               prm,
-        std::shared_ptr< util::Table >                                  table )
+        std::shared_ptr< util::Table >                                  table,
+        grid::shell::SubdomainToRankDistributionFunction owner )
     : domain_( domain )
     , coords_shell_( coords_shell )
     , coords_radii_( coords_radii )
@@ -1303,7 +1303,7 @@ class MMOCSolver : public EnergySolver< ScalarType >
     , h_( h )
     , prm_( prm )
     , table_( std::move( table ) )
-    , transport_( *domain, ownership_mask, fe::wedge::operators::shell::TimeSteppingScheme::RK4 )
+    , transport_( *domain, ownership_mask, fe::wedge::operators::shell::TimeSteppingScheme::RK4, std::move( owner ) )
     , u_prev_( "mmoc_u_prev", *domain, ownership_mask )
     , u_zero_( "mmoc_u_zero", *domain, ownership_mask )
     , g_( "mmoc_g", *domain, ownership_mask )
@@ -1348,26 +1348,22 @@ class MMOCSolver : public EnergySolver< ScalarType >
             table_,
             DiagSolverT( diag_ ) );
 
-        util::logroot << "MMOC energy solver ready (max Courant " << Transport::max_courant() << ")."
-                      << std::endl;
+        util::logroot << "MMOC energy solver ready (distributed owner sampling)." << std::endl;
     }
 
     ScalarType compute_dt( const int timestep ) override
     {
         const auto max_vel = kernels::common::max_vector_magnitude( velocity_.grid_data() );
 
-        // Diffusion is implicit, and the characteristic tracing is unconditionally stable; the bound is that
-        // the departure point must stay inside the ghost layer.
-        const auto dt_courant = Transport::max_courant() * h_ / max_vel;
-        const auto dt_cfl     = std::min(
-            static_cast< ScalarType >( prm_.time_stepping_parameters.dt_scaling ) * h_ / max_vel, dt_courant );
+        // User timestep scaling and limits control accuracy; owner routing removes the ghost-width cap.
+        const auto dt_cfl = static_cast< ScalarType >( prm_.time_stepping_parameters.dt_scaling ) * h_ / max_vel;
 
         const auto dt = std::clamp(
             ramp_dt( dt_cfl, timestep, prm_.time_stepping_parameters.initial_dt_ramp_steps ),
             static_cast< ScalarType >( prm_.time_stepping_parameters.dt_min ),
             static_cast< ScalarType >( prm_.time_stepping_parameters.dt_max ) );
 
-        util::logroot << "Computing dt (MMOC, ghost-layer Courant bound) ..." << std::endl;
+        util::logroot << "Computing dt (MMOC, distributed sampling) ..." << std::endl;
         log_timestep_info( prm_, timestep, max_vel, h_, dt_cfl, dt );
 
         return dt;
@@ -1396,23 +1392,7 @@ class MMOCSolver : public EnergySolver< ScalarType >
         transport_.step( T_, velocity_, u_prev_, dt, substeps );
         diffuse( dt, print_convergence );
 
-        if ( transport_.last_escapes() > 0 )
-        {
-            // Two causes, distinguishable by whether the count grows with dt: a Courant number above
-            // max_courant(), or the degenerate corner regions at the twelve pentagonal points of the
-            // icosahedral grid and at subdomain corners, whose count is independent of dt.
-            util::logroot << "    NOTE: " << transport_.last_escapes()
-                          << " departure points left the ghost layer and kept their previous value. If this "
-                             "count grows with dt, lower dt_scaling below "
-                          << Transport::max_courant()
-                          << "; if it is constant, it is the fixed set of degenerate corner regions."
-                          << std::endl;
-            for ( const auto& loc : transport_.last_escape_locations() )
-            {
-                util::logroot << "      escaped node: sd=" << loc[0] << " (" << loc[1] << "," << loc[2] << ","
-                              << loc[3] << ")" << std::endl;
-            }
-        }
+
     }
 
   private:

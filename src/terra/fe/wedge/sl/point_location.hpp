@@ -116,12 +116,18 @@ KOKKOS_INLINE_FUNCTION dense::Vec< T, 3 > lateral_node_position(
     const int              y,
     const CoordsShellType& coords_shell )
 {
-    dense::Vec< T, 3 > p;
-    for ( int d = 0; d < 3; ++d )
+    // Procedural geometry supplies a whole node once, rather than recomputing it per component.
+    if constexpr ( requires { coords_shell.node_position( subdomain, x, y ); } )
     {
-        p( d ) = coords_shell( subdomain, x, y, d );
+        return coords_shell.node_position( subdomain, x, y );
     }
-    return p;
+    else
+    {
+        dense::Vec< T, 3 > p;
+        for ( int d = 0; d < 3; ++d )
+            p( d ) = coords_shell( subdomain, x, y, d );
+        return p;
+    }
 }
 
 /// @brief Cone coordinates of a physical point w.r.t. an arbitrary triangle of lateral nodes.
@@ -144,7 +150,17 @@ KOKKOS_INLINE_FUNCTION void triangle_cone_coords(
         p[v] = lateral_node_position< T >( subdomain, nx[v], ny[v], coords_shell );
     }
 
-    mu = dense::Mat< T, 3, 3 >::from_col_vecs( p[0], p[1], p[2] ).inv() * X;
+    // Solve in the edge basis X = rho*p0 + mu1*(p1-p0) + mu2*(p2-p0).
+    // Inverting three nearly parallel unit vectors loses cone-radius precision on fine meshes.
+    const auto e1 = p[1] - p[0];
+    const auto e2 = p[2] - p[0];
+    const auto normal = e1.cross( e2 );
+    const T determinant = p[0].dot( normal );
+    const T rho = X.dot( normal ) / determinant;
+    const auto residual = X - p[0] * rho;
+    mu( 1 ) = residual.dot( e2.cross( p[0] ) ) / determinant;
+    mu( 2 ) = residual.dot( p[0].cross( e1 ) ) / determinant;
+    mu( 0 ) = rho - mu( 1 ) - mu( 2 );
 }
 
 /// @brief Cone coordinates of a physical point w.r.t. the triangle of a wedge cell.

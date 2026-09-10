@@ -3,6 +3,9 @@
 #include <array>
 #include <limits>
 #include <vector>
+#include <memory>
+#include "terra/grid/shell/mmoc_point_sampling.hpp"
+#include "terra/communication/shell/communication_plan.hpp"
 
 #include "communication/shell/communication.hpp"
 #include "fe/wedge/sl/ghost_exchange.hpp"
@@ -14,58 +17,18 @@
 #include "util/timer.hpp"
 
 /// @file
+/// MMOC transport with owner-routed sampling at every Runge-Kutta stage.
+/// Temperature uses monotone cubic reconstruction; velocity uses physical-wedge Q1 interpolation.
+/// Ghost values extend interpolation stencils of owned cells. A point in a ghost cell is evaluated by
+/// its owning subdomain, using bundled MPI queries when that subdomain is remote.
 ///
-/// Modified method of characteristics (MMOC) transport of a Q1 nodal field on the spherical shell.
+/// Backward tracing blends velocities with global pseudo-time tau=(substep+stage_weight)/substeps.
+/// Query location and binning precede tiled interpolation, where teams share stencil data in scratch.
+/// Diffusion remains a separate operator-splitting step in the energy solver.
 ///
-/// Solves the pure advection problem
-/// \f[
-///   \partial_t T + \mathbf{u} \cdot \nabla T = 0, \qquad t \in [t^n, t^{n+1}]
-/// \f]
-/// exactly along characteristics: for every node \f$ x_i \f$ the characteristic is traced **backwards** by
-/// integrating \f$ \mathrm{d}X/\mathrm{d}s = -\hat{\mathbf{u}}(X, s) \f$ from \f$ X(0) = x_i \f$ over
-/// \f$ s \in [0, \Delta t] \f$, and the new value is the old field evaluated at the foot point,
-/// \f$ T^{n+1}_i = T^n(X(\Delta t)) \f$.
-///
-/// The velocity is interpolated linearly in time between the two given fields. Because the integration runs
-/// backwards, pseudo-time \f$ s \f$ maps to physical time \f$ t^{n+1} - s \f$, so a stage at
-/// \f$ \tau = s / \Delta t \f$ uses \f$ (1 - \tau) \mathbf{u}^{n+1} + \tau \mathbf{u}^{n} \f$.
-///
-/// @note With more than one substep the interpolation weight is tracked in *global* pseudo-time,
-///       \f$ \tau = (m + c_k) / M \f$ for substep \f$ m \f$ of \f$ M \f$ and stage \f$ k \f$. Reusing the raw
-///       stage weight \f$ c_k \f$ in every substep -- as some implementations do -- would interpolate as if each
-///       substep spanned the whole timestep and silently drop the temporal order back to first order.
-///
-/// The scheme is unconditionally stable in the advective sense: there is no CFL restriction from the
-/// characteristic tracing itself. The *implementation* is bounded by the ghost layer width, since a foot point
-/// must remain inside the local subdomain plus its ghost layer. \ref MMOCTransport::recommended_substeps
-/// converts a Courant number into the number of substeps that keeps every substep inside that budget.
-///
-/// **Interpolation.** The field at the foot point is evaluated with
-/// \ref terra::fe::wedge::sl::evaluate_cubic_scalar — a monotone cubic reconstruction over the structured
-/// index stencil — rather than with the Q1 shape functions of the containing wedge, because multilinear
-/// evaluation is only second order and pays that error once per timestep, which is the dominant source of
-/// numerical diffusion here. The velocity stays on \ref terra::fe::wedge::sl::evaluate_q1_vec; raising it made
-/// no measurable difference to the rotation test and costs an order of magnitude more.
-///
-/// @warning This trade is **not yet settled**, and the choice of evaluator is deliberately left visible in
-///          \ref trace so it can be flipped back. Measured on `test_mmoc_rotation` at level 5, one full
-///          revolution of the cone: the cubic retains far more of the peak (0.64 versus 0.13 of the exact 1.0,
-///          i.e. much less numerical diffusion, which is what it was introduced for) but its L2 error against
-///          the exact solution is worse (1.79 versus 0.90). The reason shows up in the linear-field test: a
-///          field \f$ a + b z \f$ is reproduced by the Q1 wedge evaluation to round-off — the Q1 map *is* the
-///          geometric map, so it is exact for anything linear in \f$ x \f$ — whereas the cubic converges on it
-///          at only about order 1.4 (3.6e-2, 1.4e-2, 5.2e-3 at levels 3, 4, 5). A tensor-product stencil in
-///          index space presumes the field is a smooth function of the indices, and on this grid it is not
-///          smooth enough: the map kinks where a stencil crosses into a neighbouring diamond (confining the
-///          stencil to the owned block, as it now is, already recovered a factor of ten) and the recursive
-///          bisection places nodes off any smooth parametrisation at \f$ \mathcal{O}(h^2) \f$. Neither
-///          limiter is implicated — both the PCHIP sweep and the local range clip are inactive in these runs.
-///          Recovering the order properly needs a reconstruction that is exact for polynomials in the physical
-///          coordinates, e.g. a least-squares fit over the stencil in a local tangent frame with the
-///          coefficients precomputed per cell.
-///
-///
-/// Diffusion is not part of this operator; combine it with an implicit diffusion solve by operator splitting.
+/// The cubic method retains MMOC's index-space reconstruction and limiters. Its stencil stays within
+/// one diamond: crossing a diamond seam would mix different index charts. Internal subdomain and radial
+/// ghosts are usable; extrapolated radii beyond physical boundaries are excluded.
 
 namespace terra::fe::wedge::operators::shell
 {
@@ -162,7 +125,8 @@ class MMOCTransport
     MMOCTransport(
         const grid::shell::DistributedDomain&       domain,
         const grid::Grid4DDataScalar< grid::NodeOwnershipFlag >& ownership_mask,
-        const TimeSteppingScheme                    scheme = TimeSteppingScheme::RK4 )
+        const TimeSteppingScheme                    scheme = TimeSteppingScheme::RK4,
+        grid::shell::SubdomainToRankDistributionFunction owner = grid::shell::subdomain_to_rank_iterate_diamond_subdomains )
     : domain_( &domain )
     , ownership_mask_( ownership_mask )
     , exchange_( domain )
@@ -186,24 +150,31 @@ class MMOCTransport
             exchange_.num_nodes_lateral(),
             exchange_.num_nodes_lateral(),
             exchange_.num_nodes_radial() );
+        const auto coords = grid::shell::subdomain_unit_sphere_single_shell_coords< ScalarType >( domain );
+        const auto radii = grid::shell::subdomain_shell_radii< ScalarType >( domain );
+        sampler_ = std::make_unique< grid::shell::MMOCPointSampler< ScalarType > >(
+            domain, coords, radii, ownership_mask, std::move( owner ) );
+        interpolation_ = std::make_unique< sl::TiledInterpolator< ScalarType > >(
+            domain, T_g_, u_g_, u_old_g_, radii_g_, lateral_valid_ );
+        halo_ = std::make_unique< HaloPlan >( domain, true, true );
+        halo_buffers_ = std::make_unique< communication::shell::SubdomainNeighborhoodSendRecvBuffer< ScalarType > >( domain );
+        const auto count = ownership_mask.size();
+        trajectory_ = decltype( trajectory_ )( "mmoc_trajectory", count );
+        positions_ = decltype( positions_ )( "mmoc_stage_positions", count );
+        velocity_values_ = decltype( velocity_values_ )( "mmoc_stage_velocity", count );
+        temperature_values_ = decltype( temperature_values_ )( "mmoc_temperature_values", count );
+        stages_ = decltype( stages_ )( "mmoc_rk_stages", count );
     }
 
-    /// @brief Largest Courant number this implementation supports for a single \ref step.
-    ///
-    /// The characteristic tracing itself is unconditionally stable -- there is no CFL condition in the scheme.
-    /// What is bounded is the *distance* the departure point may travel: it has to stay inside the local
-    /// subdomain plus its ghost layer, because that is all the data available to interpolate from. Substepping
-    /// does **not** relax this: substeps refine the trajectory but the foot point still ends up a full Courant
-    /// number away. Raising the limit means widening \ref terra::fe::wedge::sl::ghost_width.
+    /// Compatibility query: owner routing imposes no ghost-width Courant limit.
     [[nodiscard]] static constexpr ScalarType max_courant()
     {
-        // A margin below the ghost width, so that the foot point stays strictly inside the ghosted region.
-        return ScalarType( 0.9 ) * sl::ghost_width;
+        return std::numeric_limits< ScalarType >::infinity();
     }
 
     /// @brief Substeps giving a trajectory error comparable to the interpolation error.
     ///
-    /// Purely an accuracy control -- see \ref max_courant for what actually limits the timestep. One substep is
+    /// Purely an accuracy control. One substep is
     /// enough for a Courant number below one with a fourth-order scheme; the count is raised only so that the
     /// per-substep rotation angle stays small when the flow turns sharply within a timestep.
     [[nodiscard]] static int substeps_for_accuracy( const ScalarType courant )
@@ -218,7 +189,7 @@ class MMOCTransport
     /// @param u             velocity at t^{n+1}
     /// @param u_old         velocity at t^n
     /// @param dt            the full timestep
-    /// @param substeps      number of substeps; see \ref recommended_substeps
+    /// @param substeps      number of substeps; see \ref substeps_for_accuracy
     /// @param global_limiter clip the interpolated value to the global range of T^n
     void step(
         linalg::VectorQ1Scalar< ScalarType >&          T,
@@ -230,9 +201,15 @@ class MMOCTransport
     {
         util::Timer timer( "mmoc_transport" );
 
-        exchange_.fill( T.grid_data(), T_g_ );
-        exchange_.fill( u.grid_data(), u_g_ );
-        exchange_.fill( u_old.grid_data(), u_old_g_ );
+        Kokkos::Profiling::ScopedRegion transport_region( "mmoc_transport" );
+        {
+            Kokkos::Profiling::ScopedRegion ghost_region( "mmoc_ghost_fill" );
+            exchange_.fill( T.grid_data(), T_g_ );
+            // Owner routing guarantees that Q1 velocity sampling uses only owned-cell vertices.
+            // Populate the existing padded layout without exchanging its unused ghost layers.
+            exchange_.copy_interior( u.grid_data(), u_g_ );
+            exchange_.copy_interior( u_old.grid_data(), u_old_g_ );
+        }
 
         ScalarType t_min = std::numeric_limits< ScalarType >::max();
         ScalarType t_max = std::numeric_limits< ScalarType >::lowest();
@@ -261,40 +238,27 @@ class MMOCTransport
             t_max = std::numeric_limits< ScalarType >::max();
         }
 
-        Kokkos::deep_copy( num_escape_locations_, 0 );
+        communication::shell::detail::point_query_require( substeps > 0 && std::isfinite( dt ), domain_->comm(),
+                                                          "invalid MMOC timestep or substep count" );
+        last_remote_queries_ = 0;
 
         long long escapes = 0;
         trace( T, dt, substeps, t_min, t_max, escapes );
 
         Kokkos::deep_copy( T.grid_data(), T_new_ );
 
-        // Duplicated interface nodes are computed independently on each side from identical ghost data; a MAX
-        // reduction removes any residual tie-breaking difference and keeps the field single-valued.
-        communication::shell::send_recv( *domain_, T.grid_data(), communication::CommunicationReduction::MAX );
+        // Only owning nodes are evaluated; SUM distributes their values to shared copies.
+        {
+            Kokkos::Profiling::ScopedRegion halo_region( "mmoc_halo" );
+            halo_->exchange_and_reduce( T.grid_data(), *halo_buffers_ );
+        }
 
         MPI_Allreduce( MPI_IN_PLACE, &escapes, 1, MPI_LONG_LONG, MPI_SUM, domain_->comm() );
         last_escapes_ = escapes;
     }
 
-    /// @brief Indices of up to 16 nodes that escaped in the last \ref step, as (subdomain, x, y, r).
-    ///
-    /// Diagnostic only; the count in \ref last_escapes is authoritative.
-    [[nodiscard]] std::vector< std::array< int, 4 > > last_escape_locations() const
-    {
-        auto host = Kokkos::create_mirror_view_and_copy( Kokkos::HostSpace{}, escape_locations_ );
-        auto n    = Kokkos::create_mirror_view_and_copy( Kokkos::HostSpace{}, num_escape_locations_ );
-
-        std::vector< std::array< int, 4 > > result;
-        for ( int i = 0; i < Kokkos::min( n(), max_escape_locations ); ++i )
-            result.push_back( { host( i, 0 ), host( i, 1 ), host( i, 2 ), host( i, 3 ) } );
-        return result;
-    }
-
-    /// @brief Number of nodes whose departure point could not be located in the last \ref step.
-    ///
-    /// Those nodes keep their previous value (no advection). A non-zero count means the per-substep Courant
-    /// number exceeded the ghost layer width, or that the departure point fell into one of the degenerate
-    /// corner regions at the twelve pentagonal points of the icosahedral grid.
+    /// Compatibility diagnostics. Successful steps resolve every sample; lookup errors abort the communicator.
+    [[nodiscard]] std::vector< std::array< int, 4 > > last_escape_locations() const { return {}; }
     [[nodiscard]] long long last_escapes() const { return last_escapes_; }
 
     /// @internal Traces the characteristics and writes the result into `T_new_`.
@@ -302,172 +266,76 @@ class MMOCTransport
     /// Public only because CUDA does not permit an extended `__host__ __device__` lambda inside a private or
     /// protected member function. Not part of the interface -- use \ref step.
     void trace(
-        const linalg::VectorQ1Scalar< ScalarType >& T,
+        const linalg::VectorQ1Scalar< ScalarType >& /*T*/,
         const ScalarType                            dt,
         const int                                   substeps,
         const ScalarType                            t_min,
         const ScalarType                            t_max,
         long long&                                  escapes )
     {
-        const sl::IndexBounds bounds{ exchange_.num_nodes_lateral_ghosted(),
-                                      exchange_.num_nodes_lateral_ghosted(),
-                                      exchange_.num_nodes_radial_ghosted() };
-
-        const sl::RadialSliceCoords< decltype( coords_g_ ) > lateral{ coords_g_, sl::ghost_width };
-
-        const auto coords_g = coords_g_;
-        const auto radii_g  = radii_g_;
-        const auto T_g      = T_g_;
-        const auto u_g      = u_g_;
-        const auto u_old_g  = u_old_g_;
-        const auto T_new    = T_new_;
-        const auto tableau  = tableau_;
-
-        const int  n_lat_g     = exchange_.num_nodes_lateral_ghosted();
-        const int  n_rad_g     = exchange_.num_nodes_radial_ghosted();
-        const int  n_lat_owned = exchange_.num_nodes_lateral();
-        const int  n_rad_owned = exchange_.num_nodes_radial();
-        const auto r_min   = r_min_;
-        const auto r_max   = r_max_;
-
-        const ScalarType h        = dt / static_cast< ScalarType >( substeps );
-        const ScalarType inv_M    = ScalarType( 1 ) / static_cast< ScalarType >( substeps );
-        constexpr int    max_walk = 4 * sl::ghost_width + 4;
-        constexpr auto   eps      = ScalarType( 1e-12 );
-
-        const auto T_old         = T.grid_data();
-        const auto lateral_valid = lateral_valid_;
-        const auto escape_loc     = escape_locations_;
-        const auto escape_loc_num = num_escape_locations_;
-
-        Kokkos::parallel_reduce(
-            "mmoc_trace_characteristics",
-            grid::shell::local_domain_md_range_policy_nodes( *domain_ ),
-            KOKKOS_LAMBDA( const int sd, const int x, const int y, const int r, long long& esc ) {
-                const int gx = sl::to_ghosted_index( x );
-                const int gy = sl::to_ghosted_index( y );
-                const int gr = sl::to_ghosted_index( r );
-
-                Vec3 p;
-                for ( int d = 0; d < 3; ++d )
-                    p( d ) = coords_g( sd, gx, gy, gr, d );
-
-                Vec3 X = p * radii_g( sd, gr );
-
-                // Stencil the cubic interpolation may read from. Laterally it is the owned block only: a
-                // lateral ghost row holds a neighbour's real values, but it belongs to another diamond, and
-                // the index-space parametrisation kinks at that seam -- a stencil straddling it is
-                // inconsistent, not just less accurate. Radially the ghost layers outside the CMB and the
-                // surface exist only so that the radii array stays monotone; they hold extrapolated radii and
-                // no field data at all, so trim them off too. In both directions the window then slides
-                // inwards near the edge (one-sided but never extrapolating), and a foot point that lands
-                // outside the range altogether falls back to the Q1 evaluation.
-                sl::StencilBounds stencil{ { sl::ghost_width, n_lat_g - 1 - sl::ghost_width },
-                                           { sl::ghost_width, n_lat_g - 1 - sl::ghost_width },
-                                           { 0, n_rad_g - 1 } };
-                {
-                    const ScalarType r_tol = ScalarType( 1e-12 ) * r_max;
-                    while ( stencil.r.lo < stencil.r.hi && radii_g( sd, stencil.r.lo ) < r_min - r_tol )
-                        ++stencil.r.lo;
-                    while ( stencil.r.hi > stencil.r.lo && radii_g( sd, stencil.r.hi ) > r_max + r_tol )
-                        --stencil.r.hi;
-                }
-
-                // Seed with a cell all of whose nodes are owned: it always contains this node as a vertex,
-                // and it can never be one of the degenerate ghost-corner wedges.
-                sl::WedgeCell cell{ sl::to_ghosted_index( Kokkos::min( x, n_lat_owned - 2 ) ),
-                                    sl::to_ghosted_index( Kokkos::min( y, n_lat_owned - 2 ) ),
-                                    sl::to_ghosted_index( Kokkos::min( r, n_rad_owned - 2 ) ),
-                                    0 };
-
-                bool escaped = false;
-
-                for ( int m = 0; m < substeps && !escaped; ++m )
-                {
-                    Vec3 kv[ButcherTableau< ScalarType >::max_stages];
-                    const Vec3 X_start = X;
-
-                    for ( int s = 0; s < tableau.stages; ++s )
-                    {
-                        Vec3 Y = X_start;
-                        for ( int l = 0; l < s; ++l )
-                            Y = Y + kv[l] * ( h * tableau.A[s][l] );
-
-                        const auto res = sl::locate_point(
-                            Y, sd, cell, lateral, radii_g, bounds, max_walk, eps,
-                            /*clamp_radially=*/true, r_min, r_max, lateral_valid );
-
-                        if ( !res.found )
-                        {
-                            escaped = true;
-                            break;
-                        }
-                        cell = res.cell;
-
-                        // The velocity is smooth by construction, so it is interpolated with the unlimited
-                        // cubic: an error here displaces the foot point and enters T just as directly as an
-                        // error in T itself, and a limiter could only cost accuracy.
-                        const auto u_new_s =
-                            sl::evaluate_q1_vec< ScalarType, 3 >( u_g, sd, res.cell, res.xi, res.eta, res.zeta );
-                        const auto u_old_s = sl::evaluate_q1_vec< ScalarType, 3 >(
-                            u_old_g, sd, res.cell, res.xi, res.eta, res.zeta );
-
-                        // Global pseudo-time of this stage, in [0, 1] across the whole timestep.
-                        const ScalarType tau = ( static_cast< ScalarType >( m ) + tableau.c[s] ) * inv_M;
-
-                        for ( int d = 0; d < 3; ++d )
-                            kv[s]( d ) = -( ( ScalarType( 1 ) - tau ) * u_new_s( d ) + tau * u_old_s( d ) );
-                    }
-
-                    if ( escaped )
-                        break;
-
-                    Vec3 X_next = X_start;
-                    for ( int s = 0; s < tableau.stages; ++s )
-                        X_next = X_next + kv[s] * ( h * tableau.b[s] );
-                    X = X_next;
-                }
-
-                if ( !escaped )
-                {
-                    const auto res = sl::locate_point(
-                        X, sd, cell, lateral, radii_g, bounds, max_walk, eps,
-                        /*clamp_radially=*/true, r_min, r_max, lateral_valid );
-
-                    if ( res.found )
-                    {
-                        const ScalarType value = sl::evaluate_cubic_scalar(
-                            T_g, sd, res.cell, res.xi, res.eta, res.zeta, radii_g, stencil, lateral_valid,
-                            /*monotone=*/true );
-                        T_new( sd, x, y, r ) = Kokkos::clamp( value, t_min, t_max );
-                        return;
-                    }
-                }
-
-                // The departure point left the ghosted region, or the walk ran into one of the degenerate
-                // corner wedges. `cell` still holds the last wedge that was accepted, so interpolate at the
-                // point of that wedge closest to the departure point: a bounded, first-order error, rather
-                // than leaving the node un-advected for a whole timestep.
-                {
-                    ScalarType xi = 0, eta = 0, zeta = 0;
-                    sl::clamp_to_wedge( X, sd, cell, lateral, radii_g, xi, eta, zeta );
-                    const ScalarType value = sl::evaluate_cubic_scalar(
-                        T_g, sd, cell, xi, eta, zeta, radii_g, stencil, lateral_valid, /*monotone=*/true );
-                    T_new( sd, x, y, r )   = Kokkos::clamp( value, t_min, t_max );
-                }
-                esc += 1;
-
-                const int slot = Kokkos::atomic_fetch_add( &escape_loc_num(), 1 );
-                if ( slot < max_escape_locations )
-                {
-                    escape_loc( slot, 0 ) = sd;
-                    escape_loc( slot, 1 ) = x;
-                    escape_loc( slot, 2 ) = y;
-                    escape_loc( slot, 3 ) = r;
-                }
-            },
-            escapes );
+        const auto coords = coords_g_;
+        const auto radii = radii_g_;
+        const auto ownership = ownership_mask_;
+        const auto trajectory = trajectory_, positions = positions_, velocities = velocity_values_;
+        const auto temperatures = temperature_values_;
+        const auto stages = stages_;
+        const auto output = T_new_;
+        const auto tableau = tableau_;
+        const int n = ownership.extent( 1 ), nr = ownership.extent( 3 );
+        const int count = communication::shell::detail::point_query_count( ownership.size(), domain_->comm() );
+        const ScalarType h = dt / ScalarType( substeps );
+        Kokkos::parallel_for( "mmoc_initialize_trajectories", count, KOKKOS_LAMBDA( int i ) {
+            const int s = i / ( n * n * nr ), x = ( i / ( n * nr ) ) % n, y = ( i / nr ) % n, r = i % nr;
+            for ( int d = 0; d < 3; ++d )
+                trajectory( i )( d ) = coords( s, x + sl::ghost_width, y + sl::ghost_width, r + sl::ghost_width, d ) *
+                                      radii( s, r + sl::ghost_width );
+        } );
+        for ( int m = 0; m < substeps; ++m )
+        {
+            for ( int stage = 0; stage < tableau.stages; ++stage )
+            {
+                Kokkos::parallel_for( "mmoc_rk_stage_positions", count, KOKKOS_LAMBDA( int i ) {
+                    auto point = trajectory( i );
+                    for ( int j = 0; j < stage; ++j ) point = point + stages( i, j ) * ( h * tableau.A[stage][j] );
+                    positions( i ) = point;
+                } );
+                const ScalarType tau = ( ScalarType( m ) + tableau.c[stage] ) / ScalarType( substeps );
+                sampler_->sample( positions, velocities, [&]( const auto& work, int size, const auto& values ) {
+                    interpolation_->template evaluate< true >( work, size, values, tau, shared_interpolation_ );
+                } );
+                last_remote_queries_ += sampler_->last_remote_queries();
+                Kokkos::parallel_for( "mmoc_rk_store_stage", count, KOKKOS_LAMBDA( int i ) {
+                    stages( i, stage ) = velocities( i ) * ScalarType( -1 );
+                } );
+            }
+            Kokkos::parallel_for( "mmoc_rk_advance", count, KOKKOS_LAMBDA( int i ) {
+                auto point = trajectory( i );
+                for ( int stage = 0; stage < tableau.stages; ++stage ) point = point + stages( i, stage ) * ( h * tableau.b[stage] );
+                trajectory( i ) = point;
+            } );
+        }
+        sampler_->sample( trajectory, temperatures, [&]( const auto& work, int size, const auto& values ) {
+            interpolation_->template evaluate< false >( work, size, values, ScalarType( 0 ), shared_interpolation_ );
+        } );
+        last_remote_queries_ += sampler_->last_remote_queries();
+        Kokkos::deep_copy( output, ScalarType( 0 ) );
+        Kokkos::parallel_for( "mmoc_store_temperature", count, KOKKOS_LAMBDA( int i ) {
+            const int s = i / ( n * n * nr ), x = ( i / ( n * nr ) ) % n, y = ( i / nr ) % n, r = i % nr;
+            if ( util::has_flag( ownership( s, x, y, r ), grid::NodeOwnershipFlag::OWNED ) )
+                output( s, x, y, r ) = Kokkos::clamp( temperatures( i ), t_min, t_max );
+        } );
         Kokkos::fence();
+        escapes = 0;
+    }
+
+    // Diagnostic reference execution uses identical stencils and arithmetic without team scratch.
+    void set_shared_interpolation( bool enabled ) { shared_interpolation_ = enabled; }
+    std::size_t last_remote_queries() const { return last_remote_queries_; }
+    std::size_t sampling_buffer_bytes() const
+    {
+        return sampler_->buffer_bytes() + interpolation_->buffer_bytes() +
+            ( trajectory_.span() + positions_.span() + velocity_values_.span() + stages_.span() ) * sizeof( Vec3 ) +
+            temperature_values_.span() * sizeof( ScalarType );
     }
 
   private:
@@ -489,9 +357,16 @@ class MMOCTransport
 
     long long last_escapes_ = 0;
 
-    static constexpr int          max_escape_locations = 16;
-    Kokkos::View< int* [4] >      escape_locations_{ "mmoc_escape_locations", max_escape_locations };
-    Kokkos::View< int >           num_escape_locations_{ "mmoc_num_escape_locations" };
+    using HaloPlan = communication::shell::ShellBoundaryCommPlan< grid::Grid4DDataScalar< ScalarType > >;
+    std::unique_ptr< grid::shell::MMOCPointSampler< ScalarType > > sampler_;
+    std::unique_ptr< sl::TiledInterpolator< ScalarType > > interpolation_;
+    std::unique_ptr< HaloPlan > halo_;
+    std::unique_ptr< communication::shell::SubdomainNeighborhoodSendRecvBuffer< ScalarType > > halo_buffers_;
+    Kokkos::View< Vec3* > trajectory_, positions_, velocity_values_;
+    Kokkos::View< Vec3*[4] > stages_;
+    Kokkos::View< ScalarType* > temperature_values_;
+    bool shared_interpolation_ = true;
+    std::size_t last_remote_queries_ = 0;
 };
 
 } // namespace terra::fe::wedge::operators::shell
